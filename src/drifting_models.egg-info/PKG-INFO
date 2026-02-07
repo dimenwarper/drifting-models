@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: drifting-models
+Version: 0.1.0
+Summary: Drifting Models for Text Generation
+Requires-Python: >=3.11
+Requires-Dist: torch>=2.1
+Requires-Dist: transformers>=4.36
+Requires-Dist: datasets>=2.16
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: wandb>=0.16
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"

@@ -1,0 +1,63 @@
+# Minimal config for smoke-testing the training loop
+
+data:
+  dataset: "roneneldan/TinyStories"
+  split: "train"
+  seq_len: 32
+  max_samples: 256
+
+generator:
+  hidden_dim: 128
+  n_layers: 2
+  n_heads: 4
+  n_style_tokens: 4
+  codebook_size: 8
+
+encoder:
+  model_name: "gpt2"
+  extract_layers: [3, 6, 9, 12]
+
+pooling:
+  n_subsample_positions: 8
+  window_sizes: [4, 16]
+
+drifting:
+  temperatures: [0.05, 0.2]
+  normalization_momentum: 0.99
+
+training:
+  batch_size: 8
+  n_pos: 8
+  queue_size: 64
+  max_steps: 20
+
+  optimizer:
+    lr: 1.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.05
+
+  scheduler:
+    warmup_steps: 5
+    min_lr_ratio: 0.01
+
+  gradient_clip: 2.0
+  ema_decay: 0.999
+  precision: "fp32"
+
+  log_interval: 5
+  save_interval: 100000
+  generate_interval: 10
+  generate_n_samples: 2
+
+inference:
+  temperature: 1.0
+  n_samples: 2
+  output_dir: "outputs"
+
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+
+wandb:
+  project: "drifting-text"
+  enabled: false

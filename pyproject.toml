@@ -1,0 +1,17 @@
+[project]
+name = "drifting-models"
+version = "0.1.0"
+description = "Drifting Models for Text Generation"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.36",
+    "datasets>=2.16",
+    "pyyaml>=6.0",
+    "wandb>=0.16",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
