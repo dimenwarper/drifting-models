@@ -6,24 +6,25 @@ The key idea of drifting models are that iteration happens at **training time** 
 
 ## Architecture
 
-```
-Noise (B, seq_len, 768) --> [DiT Generator] --> Continuous embeddings (B, seq_len, 768)
-                                                        |
-                                    +-------------------+
-                                    v                   v
-                              [GPT-2 frozen]      [GPT-2 frozen]
-                              (inputs_embeds)      (input_ids)
-                                    |                   |
-                                    v                   v
-                              Gen features         Real features
-                                    |                   |
-                                    +--------+----------+
-                                             v
-                                    [Drifting Field V]
-                                    (attraction - repulsion)
-                                             |
-                                             v
-                                    MSE(phi(x), sg(phi(x) + V))
+```mermaid
+graph TD
+    N["Noise (B, seq_len, 768)"] --> G["DiT Generator"]
+    G --> E["Continuous Embeddings (B, seq_len, 768)"]
+
+    E --> GPT2_gen["GPT-2 frozen
+    (inputs_embeds)"]
+    R["Real Token IDs"] --> GPT2_real["GPT-2 frozen
+    (input_ids)"]
+
+    GPT2_gen --> F_gen["Gen Features"]
+    GPT2_real --> F_real["Real Features"]
+
+    F_gen --> V["Drifting Field V
+    (attraction - repulsion)"]
+    F_real --> V
+
+    V --> L["MSE(phi(x), sg(phi(x) + V))"]
+    F_gen --> L
 ```
 
 At inference: `noise -> generator -> nearest-neighbor to GPT-2 vocab embeddings -> tokens`.
