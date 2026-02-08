@@ -55,6 +55,7 @@ class QKNormAttention(nn.Module):
         x: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S, _ = x.shape
 
@@ -75,7 +76,7 @@ class QKNormAttention(nn.Module):
         k = apply_rope(k, rope_cos, rope_sin)
 
         # Scaled dot-product attention
-        out = F.scaled_dot_product_attention(q, k, v)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).reshape(B, S, -1)
         return self.wo(out)
 
@@ -122,6 +123,7 @@ class DiTBlock(nn.Module):
         c: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # adaLN modulations: scale1, shift1, gate1, scale2, shift2, gate2
         s1, sh1, g1, s2, sh2, g2 = self.adaln(c)
@@ -129,7 +131,7 @@ class DiTBlock(nn.Module):
         # Attention branch
         h = self.norm1(x)
         h = h * (1 + s1) + sh1
-        h = self.attn(h, rope_cos, rope_sin)
+        h = self.attn(h, rope_cos, rope_sin, attn_mask=attn_mask)
         x = x + g1 * h
 
         # FFN branch
@@ -202,30 +204,50 @@ class DriftingGenerator(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, noise: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        noise: torch.Tensor,
+        prefix_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
-            noise: (B, seq_len, hidden_dim) Gaussian noise
+            noise: (B, suffix_len, hidden_dim) Gaussian noise
+            prefix_embeds: (B, prefix_len, hidden_dim) optional prefix embeddings
+                           (already in generator's hidden_dim space)
 
         Returns:
-            (B, seq_len, hidden_dim) continuous embeddings
+            (B, prefix_len + suffix_len, hidden_dim) continuous embeddings
         """
-        B, S, C = noise.shape
+        B, S_noise, C = noise.shape
 
-        # Project input
-        x = self.input_proj(noise)
+        # Project noise
+        x_noise = self.input_proj(noise)
 
-        # Build conditioning: global noise stats + style
+        # Build conditioning from noise only (not prefix)
         noise_mean = noise.mean(dim=1)  # (B, C)
         style = self.style(B, noise.device)  # (B, C)
         cond = self.cond_mlp(noise_mean + style)  # (B, C)
 
-        # Get RoPE
-        rope_cos, rope_sin = self.rope(S)
+        # Handle prefix
+        attn_mask = None
+        if prefix_embeds is not None:
+            prefix_len = prefix_embeds.shape[1]
+            x_prefix = self.input_proj(prefix_embeds)
+            x = torch.cat([x_prefix, x_noise], dim=1)  # (B, P+S, C)
+            attn_mask = build_prefix_causal_mask(
+                prefix_len, S_noise, device=noise.device, dtype=noise.dtype,
+            )
+        else:
+            x = x_noise
+
+        total_len = x.shape[1]
+
+        # Get RoPE for full sequence
+        rope_cos, rope_sin = self.rope(total_len)
 
         # Transformer blocks
         for block in self.blocks:
-            x = block(x, cond, rope_cos, rope_sin)
+            x = block(x, cond, rope_cos, rope_sin, attn_mask=attn_mask)
 
         # Final projection
         s, sh = self.final_adaln(cond)
@@ -234,3 +256,27 @@ class DriftingGenerator(nn.Module):
         x = self.output_proj(x)
 
         return x
+
+
+def build_prefix_causal_mask(
+    prefix_len: int,
+    suffix_len: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build attention mask: prefix-causal (suffix sees prefix, prefix doesn't see suffix).
+
+    Mask layout (True = allowed to attend):
+        prefix positions attend to: prefix only
+        suffix positions attend to: prefix + suffix
+
+    Returns:
+        (1, 1, total_len, total_len) bool mask for scaled_dot_product_attention
+    """
+    total = prefix_len + suffix_len
+    # Start with all allowed
+    mask = torch.ones(total, total, device=device, dtype=torch.bool)
+    # Block prefix from attending to suffix
+    mask[:prefix_len, prefix_len:] = False
+    # Return as (1, 1, T, T) for broadcasting over batch and heads
+    return mask.unsqueeze(0).unsqueeze(0)

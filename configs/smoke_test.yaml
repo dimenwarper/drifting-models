@@ -5,6 +5,9 @@ data:
   split: "train"
   seq_len: 32
   max_samples: 256
+  prompt_conditioning: true
+  min_prefix_len: 4
+  max_prefix_len: 16
 
 generator:
   hidden_dim: 128

@@ -29,12 +29,14 @@ class TextFeaturePooler(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        offset: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Pool hidden states into multiple scales.
 
         Args:
             hidden_states: (B, seq_len, C)
             attention_mask: (B, seq_len), 1 for valid, 0 for padding
+            offset: number of leading positions to skip (e.g., prefix length)
 
         Returns:
             Dict with keys:
@@ -43,6 +45,11 @@ class TextFeaturePooler(nn.Module):
                 "window_4": (B * n_windows, 2*C)
                 "window_16": (B * n_windows, 2*C)
         """
+        if offset > 0:
+            hidden_states = hidden_states[:, offset:]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, offset:]
+
         B, S, C = hidden_states.shape
         result = {}
 
@@ -92,6 +99,7 @@ def pool_features(
     layer_features: dict[int, torch.Tensor],
     pooler: TextFeaturePooler,
     attention_mask: torch.Tensor | None = None,
+    offset: int = 0,
 ) -> list[tuple[str, torch.Tensor]]:
     """Pool features from all layers into a flat list.
 
@@ -99,13 +107,14 @@ def pool_features(
         layer_features: dict from layer index to (B, seq_len, C)
         pooler: TextFeaturePooler instance
         attention_mask: (B, seq_len)
+        offset: number of leading positions to skip (e.g., prefix length)
 
     Returns:
         List of (name, tensor) pairs for each (layer, pool_type) combination.
     """
     all_pooled = []
     for layer_idx in sorted(layer_features.keys()):
-        pooled = pooler(layer_features[layer_idx], attention_mask)
+        pooled = pooler(layer_features[layer_idx], attention_mask, offset=offset)
         for pool_name, tensor in pooled.items():
             all_pooled.append((f"L{layer_idx}_{pool_name}", tensor))
     return all_pooled

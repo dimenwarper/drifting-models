@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0, help="Decoding temperature")
     parser.add_argument("--output", default=None, help="Output file (default: stdout)")
     parser.add_argument("--use_ema", action="store_true", default=True, help="Use EMA weights")
+    parser.add_argument("--prefix", default=None, help="Text prefix for conditional generation")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,7 +53,7 @@ def main():
     generator.load_state_dict(ckpt[key])
     generator.eval()
 
-    # Embed projection (when generator hidden_dim != encoder hidden_dim)
+    # Embed projection (gen_dim -> enc_dim)
     embed_proj = None
     if gen_dim != enc_dim:
         embed_proj = nn.Linear(gen_dim, enc_dim, bias=True).to(device)
@@ -60,29 +61,67 @@ def main():
             embed_proj.load_state_dict(ckpt["embed_proj"])
         embed_proj.eval()
 
+    # Prefix projection (enc_dim -> gen_dim)
+    prefix_proj = None
+    if gen_dim != enc_dim:
+        prefix_proj = nn.Linear(enc_dim, gen_dim, bias=True).to(device)
+        if "prefix_proj" in ckpt:
+            prefix_proj.load_state_dict(ckpt["prefix_proj"])
+        prefix_proj.eval()
+
     step = ckpt.get("step", "?")
     print(f"Loaded checkpoint from step {step} (using {key} weights)")
 
-    # Generate
+    # Tokenizer
     S = cfg["data"]["seq_len"]
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
-    noise = torch.randn(args.n_samples, S, gen_dim, device=device)
+    # Handle prefix
+    prefix_text = ""
+    prefix_embeds_gen = None
+    prefix_len = 0
+    if args.prefix:
+        prefix_ids = tokenizer.encode(args.prefix, return_tensors="pt").to(device)
+        prefix_len = prefix_ids.shape[1]
+        if prefix_len >= S:
+            print(f"Warning: prefix ({prefix_len} tokens) >= seq_len ({S}), truncating")
+            prefix_ids = prefix_ids[:, :S - 1]
+            prefix_len = prefix_ids.shape[1]
+
+        prefix_text = tokenizer.decode(prefix_ids[0])
+        print(f"Prefix ({prefix_len} tokens): {prefix_text}")
+
+        with torch.no_grad():
+            prefix_embeds = encoder.embed_tokens(prefix_ids)  # (1, P, 768)
+            prefix_embeds = prefix_embeds.expand(args.n_samples, -1, -1)  # (N, P, 768)
+            if prefix_proj is not None:
+                prefix_embeds_gen = prefix_proj(prefix_embeds)
+            else:
+                prefix_embeds_gen = prefix_embeds
+
+    # Generate
+    suffix_len = S - prefix_len
+    noise = torch.randn(args.n_samples, suffix_len, gen_dim, device=device)
     with torch.no_grad():
-        embeddings = generator(noise)
+        gen_out = generator(noise, prefix_embeds=prefix_embeds_gen)
+        suffix_out = gen_out[:, prefix_len:]  # slice suffix
         if embed_proj is not None:
-            embeddings = embed_proj(embeddings)
+            suffix_out = embed_proj(suffix_out)
 
     # Vocab distance stats
-    dist_stats = compute_vocab_distances(embeddings, vocab_embeddings)
+    dist_stats = compute_vocab_distances(suffix_out, vocab_embeddings)
     print(f"Vocab distance stats: {dist_stats}")
 
-    # Decode
-    texts = decode_to_text(embeddings, vocab_embeddings, tokenizer, temperature=args.temperature)
+    # Decode suffix
+    suffix_texts = decode_to_text(suffix_out, vocab_embeddings, tokenizer, temperature=args.temperature)
 
     # Output
     output_lines = []
-    for i, text in enumerate(texts):
+    for i, suffix in enumerate(suffix_texts):
+        if prefix_text:
+            text = f"{prefix_text}{suffix}"
+        else:
+            text = suffix
         line = f"[{i:3d}] {text}"
         output_lines.append(line)
         print(line)

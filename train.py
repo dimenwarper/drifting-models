@@ -3,6 +3,7 @@
 import os
 import copy
 import math
+import random
 import logging
 from pathlib import Path
 
@@ -90,17 +91,21 @@ def train(config_path: str = "configs/default.yaml"):
         vocab_embed_mean=vocab_mean,
     ).to(device)
 
-    # Projection from generator hidden_dim to GPT-2 hidden_dim (if different)
+    # Projections between generator hidden_dim and GPT-2 hidden_dim (if different)
     gen_dim = cfg["generator"]["hidden_dim"]
     enc_dim = encoder.hidden_dim
-    embed_proj = None
+    embed_proj = None   # gen_dim -> enc_dim (for feeding generator output to GPT-2)
+    prefix_proj = None  # enc_dim -> gen_dim (for feeding GPT-2 embeddings to generator)
     if gen_dim != enc_dim:
         embed_proj = nn.Linear(gen_dim, enc_dim, bias=True).to(device)
-        logger.info(f"Added embed projection: {gen_dim} -> {enc_dim}")
+        prefix_proj = nn.Linear(enc_dim, gen_dim, bias=True).to(device)
+        logger.info(f"Added embed projection: {gen_dim} <-> {enc_dim}")
 
     n_params = sum(p.numel() for p in generator.parameters())
     if embed_proj is not None:
         n_params += sum(p.numel() for p in embed_proj.parameters())
+    if prefix_proj is not None:
+        n_params += sum(p.numel() for p in prefix_proj.parameters())
     logger.info(f"Generator parameters: {n_params:,}")
 
     # EMA model
@@ -149,6 +154,8 @@ def train(config_path: str = "configs/default.yaml"):
     opt_params = list(generator.parameters())
     if embed_proj is not None:
         opt_params += list(embed_proj.parameters())
+    if prefix_proj is not None:
+        opt_params += list(prefix_proj.parameters())
     optimizer = torch.optim.AdamW(
         opt_params,
         lr=opt_cfg["lr"],
@@ -166,6 +173,13 @@ def train(config_path: str = "configs/default.yaml"):
     tc = cfg["training"]
     sc = tc["scheduler"]
     use_bf16 = tc["precision"] == "bf16" and device.type == "cuda"
+
+    # Prompt conditioning config
+    use_prefix = cfg["data"].get("prompt_conditioning", False)
+    min_prefix = cfg["data"].get("min_prefix_len", 16)
+    max_prefix = cfg["data"].get("max_prefix_len", 128)
+    if use_prefix:
+        logger.info(f"Prompt conditioning enabled: prefix_len in [{min_prefix}, {max_prefix}]")
 
     checkpoint_dir = Path(cfg["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -193,22 +207,41 @@ def train(config_path: str = "configs/default.yaml"):
         B = tc["batch_size"]
         S = cfg["data"]["seq_len"]
         C = cfg["generator"]["hidden_dim"]
-        noise = torch.randn(B, S, C, device=device)
 
-        gen_embeddings = generator(noise)  # (B, S, C)
+        # Prompt conditioning: random prefix split
+        prefix_len = 0
+        prefix_embeds_gen = None
+        if use_prefix:
+            prefix_len = random.randint(min_prefix, min(max_prefix, S - 1))
+            with torch.no_grad():
+                prefix_embeds = encoder.embed_tokens(input_ids[:B, :prefix_len])  # (B, P, 768)
+            if prefix_proj is not None:
+                prefix_embeds_gen = prefix_proj(prefix_embeds.detach())
+            else:
+                prefix_embeds_gen = prefix_embeds.detach()
+
+        suffix_len = S - prefix_len
+        noise = torch.randn(B, suffix_len, C, device=device)
+
+        gen_out = generator(noise, prefix_embeds=prefix_embeds_gen)  # (B, P+suffix, C)
+
+        # Slice suffix only for feature extraction
+        suffix_out = gen_out[:, prefix_len:]  # (B, suffix_len, C)
 
         # Project to encoder dim if needed
-        enc_input = embed_proj(gen_embeddings) if embed_proj is not None else gen_embeddings
+        enc_input = embed_proj(suffix_out) if embed_proj is not None else suffix_out
 
         # Extract features — no_grad for real data, grad for generated (to backprop to generator)
+        suffix_ids = input_ids[:, prefix_len:]
+        suffix_mask = attention_mask[:, prefix_len:]
         with torch.no_grad():
             with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
-                real_features = encoder(input_ids=input_ids, attention_mask=attention_mask)
+                real_features = encoder(input_ids=suffix_ids, attention_mask=suffix_mask)
         with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
             gen_features = encoder(inputs_embeds=enc_input, attention_mask=None)
 
-        # Pool features
-        real_pooled = pool_features(real_features, pooler, attention_mask)
+        # Pool features (suffix only — already sliced)
+        real_pooled = pool_features(real_features, pooler, suffix_mask)
         gen_pooled = pool_features(gen_features, pooler, None)
 
         # Compute drifting loss (in fp32)
@@ -285,6 +318,8 @@ def train(config_path: str = "configs/default.yaml"):
             }
             if embed_proj is not None:
                 ckpt["embed_proj"] = embed_proj.state_dict()
+            if prefix_proj is not None:
+                ckpt["prefix_proj"] = prefix_proj.state_dict()
             path = checkpoint_dir / f"step_{step:07d}.pt"
             torch.save(ckpt, path)
             logger.info(f"Saved checkpoint: {path}")

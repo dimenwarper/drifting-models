@@ -52,8 +52,39 @@ Training uses TinyStories with a frozen GPT-2 feature encoder. The generator is 
 ## Generation
 
 ```bash
+# Unconditional generation
 .venv/bin/python generate.py --checkpoint checkpoints/step_0050000.pt --n_samples 16 --temperature 1.0
+
+# Prompt-conditioned generation
+.venv/bin/python generate.py --checkpoint checkpoints/step_0050000.pt --n_samples 8 --prefix "Once upon a time"
 ```
+
+### Prompt Conditioning
+
+The generator supports prefix-conditioned continuation. During training, each batch is randomly split into a prefix (fed as GPT-2 embeddings) and a suffix (generated from noise). The DiT uses prefix-causal attention — suffix positions attend to the prefix for context, but the prefix cannot attend to the suffix. Only the suffix is supervised by the drifting loss.
+
+At inference, pass `--prefix "your text"` and the model generates a continuation. The prefix is preserved exactly and the suffix is decoded via nearest-neighbor lookup.
+
+```mermaid
+graph LR
+    P["Prefix Embeddings"] --> G["DiT Generator
+    (prefix-causal attention)"]
+    N["Noise"] --> G
+    G --> O["prefix | suffix"]
+    O --> D["Decode Suffix"]
+    D --> T["prefix text + generated continuation"]
+```
+
+Configured in YAML:
+
+```yaml
+data:
+  prompt_conditioning: true
+  min_prefix_len: 16    # random prefix length range per batch
+  max_prefix_len: 128
+```
+
+Set `prompt_conditioning: false` to train unconditionally (original behavior).
 
 ## Tests
 

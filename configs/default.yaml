@@ -6,6 +6,9 @@ data:
   split: "train"
   seq_len: 256
   max_samples: null  # null = use all
+  prompt_conditioning: true
+  min_prefix_len: 16
+  max_prefix_len: 128
 
 # Generator
 generator:
