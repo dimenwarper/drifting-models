@@ -283,6 +283,8 @@ def train(config_path: str = "configs/default.yaml"):
                 "optimizer": optimizer.state_dict(),
                 "config": cfg,
             }
+            if embed_proj is not None:
+                ckpt["embed_proj"] = embed_proj.state_dict()
             path = checkpoint_dir / f"step_{step:07d}.pt"
             torch.save(ckpt, path)
             logger.info(f"Saved checkpoint: {path}")

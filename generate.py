@@ -2,6 +2,7 @@
 
 import argparse
 import torch
+import torch.nn as nn
 import yaml
 from pathlib import Path
 from transformers import GPT2Tokenizer
@@ -31,9 +32,12 @@ def main():
     vocab_embeddings = encoder.get_vocab_embeddings().to(device)
     vocab_mean = vocab_embeddings.mean(dim=0)
 
+    gen_dim = cfg["generator"]["hidden_dim"]
+    enc_dim = encoder.hidden_dim
+
     # Build generator
     generator = DriftingGenerator(
-        hidden_dim=cfg["generator"]["hidden_dim"],
+        hidden_dim=gen_dim,
         n_layers=cfg["generator"]["n_layers"],
         n_heads=cfg["generator"]["n_heads"],
         seq_len=cfg["data"]["seq_len"],
@@ -48,17 +52,26 @@ def main():
     generator.load_state_dict(ckpt[key])
     generator.eval()
 
+    # Embed projection (when generator hidden_dim != encoder hidden_dim)
+    embed_proj = None
+    if gen_dim != enc_dim:
+        embed_proj = nn.Linear(gen_dim, enc_dim, bias=True).to(device)
+        if "embed_proj" in ckpt:
+            embed_proj.load_state_dict(ckpt["embed_proj"])
+        embed_proj.eval()
+
     step = ckpt.get("step", "?")
     print(f"Loaded checkpoint from step {step} (using {key} weights)")
 
     # Generate
     S = cfg["data"]["seq_len"]
-    C = cfg["generator"]["hidden_dim"]
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
-    noise = torch.randn(args.n_samples, S, C, device=device)
+    noise = torch.randn(args.n_samples, S, gen_dim, device=device)
     with torch.no_grad():
         embeddings = generator(noise)
+        if embed_proj is not None:
+            embeddings = embed_proj(embeddings)
 
     # Vocab distance stats
     dist_stats = compute_vocab_distances(embeddings, vocab_embeddings)

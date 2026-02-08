@@ -45,7 +45,7 @@ training:
   precision: "fp32"
 
   log_interval: 5
-  save_interval: 100000
+  save_interval: 20
   generate_interval: 10
   generate_n_samples: 2
 
