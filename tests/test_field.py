@@ -41,10 +41,10 @@ def test_anti_symmetry(seed):
     phi_b = torch.randn(N, C)
 
     # V with a as positives, b as negatives
-    V_ab = compute_V_single_temp(phi_x, phi_a, phi_b, tau=0.1)
+    V_ab = compute_V_single_temp(phi_x, phi_a, phi_b, tau=0.1)["V"]
 
     # V with b as positives, a as negatives
-    V_ba = compute_V_single_temp(phi_x, phi_b, phi_a, tau=0.1)
+    V_ba = compute_V_single_temp(phi_x, phi_b, phi_a, tau=0.1)["V"]
 
     # Should be anti-symmetric: V_ab ~ -V_ba
     assert torch.allclose(V_ab, -V_ba, atol=1e-5), \
@@ -57,7 +57,7 @@ def test_zero_at_equilibrium(seed):
     phi_x = torch.randn(N, C)
     phi_same = torch.randn(N, C)  # same distribution for both pos and neg
 
-    V = compute_V_single_temp(phi_x, phi_same, phi_same, tau=0.1)
+    V = compute_V_single_temp(phi_x, phi_same, phi_same, tau=0.1)["V"]
 
     assert torch.allclose(V, torch.zeros_like(V), atol=1e-5), \
         f"V not zero at equilibrium. Max: {V.abs().max():.6f}"
@@ -69,7 +69,7 @@ def test_zero_at_equilibrium_exact(seed):
     phi_x = torch.randn(N, C)
     phi_same = torch.randn(N, C)
 
-    V = compute_V_single_temp(phi_x, phi_same, phi_same, tau=0.05)
+    V = compute_V_single_temp(phi_x, phi_same, phi_same, tau=0.05)["V"]
 
     assert V.abs().max() < 1e-6, \
         f"V not zero when pos==neg. Max: {V.abs().max():.6f}"
@@ -83,11 +83,11 @@ def test_multi_temperature(seed):
     phi_neg = torch.randn(N, C)
 
     temps = (0.02, 0.05, 0.2)
-    V_multi = compute_V(phi_x, phi_pos, phi_neg, temperatures=temps, self_mask=False)
+    V_multi = compute_V(phi_x, phi_pos, phi_neg, temperatures=temps, self_mask=False)["V"]
 
     V_sum = torch.zeros_like(phi_x)
     for tau in temps:
-        V_sum += compute_V_single_temp(phi_x, phi_pos, phi_neg, tau)
+        V_sum += compute_V_single_temp(phi_x, phi_pos, phi_neg, tau)["V"]
 
     assert torch.allclose(V_multi, V_sum, atol=1e-5)
 
@@ -99,7 +99,7 @@ def test_gradient_flow(seed):
     phi_pos = torch.randn(N, C)
     phi_neg = torch.randn(N, C)
 
-    V = compute_V(phi_x, phi_pos, phi_neg, temperatures=(0.1,), self_mask=False)
+    V = compute_V(phi_x, phi_pos, phi_neg, temperatures=(0.1,), self_mask=False)["V"]
     loss = V.pow(2).sum()
     loss.backward()
 
@@ -115,10 +115,13 @@ def test_self_mask(seed):
     phi_pos = torch.randn(N, C)
 
     # With self_mask=True and phi_neg is phi_x
-    V = compute_V(phi_x, phi_pos, phi_x, temperatures=(0.1,), self_mask=True)
+    result = compute_V(phi_x, phi_pos, phi_x, temperatures=(0.1,), self_mask=True)
+    V = result["V"]
 
     assert V.shape == (N, C)
     assert not torch.isnan(V).any()
+    assert result["V_attract"].shape == (N, C)
+    assert result["V_repel"].shape == (N, C)
 
 
 def test_output_shape(seed):
@@ -128,5 +131,7 @@ def test_output_shape(seed):
     phi_pos = torch.randn(48, C)
     phi_neg = torch.randn(24, C)
 
-    V = compute_V(phi_x, phi_pos, phi_neg, self_mask=False)
-    assert V.shape == (N, C)
+    result = compute_V(phi_x, phi_pos, phi_neg, self_mask=False)
+    assert result["V"].shape == (N, C)
+    assert result["V_attract"].shape == (N, C)
+    assert result["V_repel"].shape == (N, C)

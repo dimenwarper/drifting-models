@@ -21,8 +21,16 @@ class DriftingLoss:
         self,
         temperatures: tuple[float, ...] = (0.02, 0.05, 0.2),
         momentum: float = 0.99,
+        max_V_norm: float | None = None,
+        normalize_drift: bool = True,
+        loss_fn: str = "mse",
+        huber_delta: float = 1.0,
     ):
         self.temperatures = temperatures
+        self.max_V_norm = max_V_norm
+        self.normalize_drift = normalize_drift
+        self.loss_fn = loss_fn
+        self.huber_delta = huber_delta
         self.feat_normalizers: dict[str, FeatureNormalizer] = {}
         self.drift_normalizers: dict[str, DriftNormalizer] = {}
 
@@ -72,22 +80,33 @@ class DriftingLoss:
 
             # Compute drifting field
             self_mask = neg_features is gen_features
-            V = compute_V(
+            V_result = compute_V(
                 phi_gen_n,
                 phi_pos_n,
                 phi_neg_n if not self_mask else phi_gen_n,
                 temperatures=self.temperatures,
                 self_mask=self_mask,
             )
+            V = V_result["V"]
 
-            # Update and apply drift normalization
+            # Update and optionally apply drift normalization
             with torch.no_grad():
                 drift_norm.update_lambda(V.detach())
-            V = drift_norm.normalize(V)
+            if self.normalize_drift:
+                V = drift_norm.normalize(V)
 
-            # MSE loss: ||phi(x) - sg(phi(x) + V)||^2
+            # Clamp V magnitude to prevent positive feedback divergence
+            if self.max_V_norm is not None:
+                V_norms = V.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                clamp_mask = V_norms > self.max_V_norm
+                V = torch.where(clamp_mask, V * (self.max_V_norm / V_norms), V)
+
+            # Loss: push phi(x) toward sg(phi(x) + V)
             target = (phi_gen_n + V).detach()  # stop gradient
-            loss = F.mse_loss(phi_gen_n, target)
+            if self.loss_fn == "huber":
+                loss = F.smooth_l1_loss(phi_gen_n, target, beta=self.huber_delta)
+            else:
+                loss = F.mse_loss(phi_gen_n, target)
 
             total_loss = total_loss + loss
 
@@ -95,6 +114,11 @@ class DriftingLoss:
             with torch.no_grad():
                 metrics[f"{name}/loss"] = loss.item()
                 metrics[f"{name}/V_norm"] = V.norm(dim=-1).mean().item()
+                metrics[f"{name}/V_raw_norm"] = V_result["V"].norm(dim=-1).mean().item()
+                metrics[f"{name}/attraction_norm"] = V_result["V_attract"].norm(dim=-1).mean().item()
+                metrics[f"{name}/repulsion_norm"] = V_result["V_repel"].norm(dim=-1).mean().item()
+                if drift_norm.running_lambda is not None:
+                    metrics[f"{name}/drift_lambda"] = drift_norm.running_lambda
                 if feat_norm.running_scale is not None:
                     metrics[f"{name}/feat_scale"] = feat_norm.running_scale
 

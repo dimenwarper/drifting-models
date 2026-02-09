@@ -1,0 +1,149 @@
+# Experimental Log — Drifting Models
+
+## 2026-02-09: Anti-collapse + training stability
+
+### Problem
+Training collapses — all outputs become repetitive ("CharlesCharlesCharles...") with
+vocab_dist/mean=103, std=0.4. Generator converges to a single off-manifold point.
+Root cause: when all generated samples are identical, the self-contrastive repulsion
+term produces zero gradient (all negatives at the same point). Once collapse begins,
+there's no signal to escape.
+
+### Experiment 1: Debug config + diagnostics + diversity regularizer
+**Config**: `configs/debug.yaml` (hidden_dim=256, 4 layers, batch=32, 5000 steps)
+**Changes**:
+- Added `gen_diversity` metric (avg pairwise L2 in gen space) to detect collapse early
+- Added `attraction_norm` / `repulsion_norm` split tracking in field.py
+- Added diversity regularizer: `1/(avg_dist + 1e-4)` penalty on generator output
+- Enhanced logging: per-scale V_norm, feat_scale, min/max scale loss
+
+**Result**: NaN immediately at step 25. All metrics NaN.
+
+**Root cause**: `pairwise_l2` did `dist_sq.clamp(min=0).sqrt()` — gradient of sqrt(x)
+at x=0 is infinity. Self-distance diagonal is exactly 0 → NaN gradients everywhere.
+
+**Fix**: `(dist_sq + 1e-8).sqrt()` in field.py.
+
+---
+
+### Experiment 2: Shrink debug config for Mac iteration
+**Config**: Reduced to hidden_dim=128, 2 layers, batch=8, seq_len=32, 1000 samples,
+500 steps, fp32. Target: run on CPU/Mac for fast iteration.
+**Changes**: Also lowered LR (1e-4 → 3e-5), tightened grad clip (2.0 → 0.5).
+
+**Result**: Loss decreases nicely 15→2.8 (steps 10-80), then oscillates and diverges
+back to 10-20 by step 200+. Grad norms 100-600x above clip threshold. Attraction
+dominates repulsion ~3:1 (attract=40-60, repel=10-20).
+
+**Root cause**: Positive feedback loop — V grows → loss (≈||V||²) grows → large
+gradients → generator overshoots → V grows more. DriftNormalizer with momentum=0.99
+can't track the growing V fast enough. Also, grad clipping only applied to generator
+params, not projection layers (embed_proj, prefix_proj).
+
+**Fixes**:
+- Grad clipping now covers all trainable params (generator + projections)
+- Still diverged with just that fix.
+
+---
+
+### Experiment 3: V magnitude clamping + faster normalization
+**Config**: debug.yaml with `normalization_momentum: 0.9`, `max_V_norm: 5.0`
+**Changes**:
+- Added `max_V_norm` to DriftingLoss — after drift normalization, clamp any V with
+  ||V|| > max_V_norm by scaling it down. Breaks the positive feedback loop.
+- Lowered normalization momentum 0.99 → 0.9 so running_lambda tracks faster.
+- Added prompt-conditioned generation ("Once upon a time ") for sample logging.
+
+**Result**: Loss stable at ~0.32 (no divergence!), but completely flat — no learning.
+V_norm saturates at 4.9-5.0 every step. Grad norms down to 5-25 (much better).
+Samples don't improve. Attraction=30-40, repulsion=10-17.
+
+**Root cause**: max_V_norm=5.0 is way too tight. Features are 768-dim, so after drift
+normalization the expected ||V|| ≈ sqrt(768) ≈ 28. Clamping to 5 kills the gradient
+signal — model gets direction info but effectively zero magnitude, so loss is constant
+at ~||V_max||²/C ≈ 0.32.
+
+---
+
+### Experiment 4: Raise max_V_norm + normalizer diagnostics
+**Config**: debug.yaml with `max_V_norm: 30.0` (≈ sqrt(768))
+**Changes**:
+- Raised max_V_norm from 5.0 → 30.0 to match expected normalized V magnitude
+- Added `V_raw_norm` metric (pre-normalization V magnitude) to see normalizer effect
+- Added `drift_lambda` metric to see what the normalizer is tracking
+- Shortened log labels (attract→a, repel→r, diversity→div) to reduce line noise
+
+**Result**: Loss drops 10→2 (steps 10-150), then climbs back to 6-7 by step 360.
+Not a divergence blowup — it's λ converging. λ shrinks from 4.9→1.5, inflating
+normalized V from 10→22, which inflates loss. V_raw stays flat at 35-40.
+
+**Root cause**: The drift normalizer is working as designed: ||V/λ||²/C → 1. But this
+makes the loss ALWAYS ≈ num_scales * 1.0 ≈ 8, regardless of model quality. Loss is
+uninformative — it's being normalized away. V_raw staying at 35-40 means the model
+isn't actually getting closer to the real distribution.
+
+**Insight**: The normalizer creates a moving target. As model improves (V_raw↓), λ also
+shrinks → normalized V stays the same → loss stays the same → gradient magnitude stays
+the same. The model never gets a signal that it's improving.
+
+---
+
+### Experiment 5: Disable drift normalization
+**Config**: debug.yaml with `normalize_drift: false`, `max_V_norm: 10.0`
+**Changes**:
+- Added `normalize_drift` flag to DriftingLoss (default true for backward compat)
+- Disabled drift normalization in debug config — V = raw field, clamped at 10.0
+- max_V_norm=10 prevents divergence (raw V starts at ~40, clamped to manageable range)
+- Lambda still tracked for diagnostics but not applied
+
+**Rationale**: Without normalization, the loss directly reflects V magnitude. If the
+model improves (gen features approach real distribution), V_raw decreases, loss
+decreases — we get a real training signal. The clamp prevents the initial large V from
+causing divergence.
+
+**Result**: V pinned at clamp (~9.8-10.0) entire run. V_raw drops 160→35 but stays
+well above max_V_norm=10. Loss flat at ~1.28. Same saturation issue as experiment 3
+with max_V_norm=5, just at a different constant.
+
+**Root cause**: max_V_norm clamp + MSE is fundamentally broken for this problem:
+- Too low → loss constant, no learning signal
+- Too high → quadratic MSE causes gradient explosion and divergence
+- "Just right" doesn't exist because V_raw varies from 160 (early) to 35 (converged)
+
+---
+
+### Experiment 6: Huber loss — no clamp needed
+**Config**: debug.yaml with `loss_fn: "huber"`, `huber_delta: 1.0`, no max_V_norm
+**Changes**:
+- Added configurable loss function to DriftingLoss: "mse" (default) or "huber"
+- Huber loss = quadratic for |V_element| < delta, linear for |V_element| > delta
+- For V_raw ≈ 35, C=768: per-element |V| ≈ 35/sqrt(768) ≈ 1.26, right at transition
+- Large V → linear loss → bounded gradients → no divergence
+- Small V → quadratic loss → fine-grained signal near equilibrium
+- No clamp needed — Huber naturally handles the full dynamic range
+- Removed max_V_norm from debug config
+
+**Rationale**: MSE(V) = V² makes large V catastrophic (quadratic gradient explosion).
+Huber(V) = |V| - δ/2 for large V gives constant-magnitude gradients. As V_raw
+decreases during training, loss decreases linearly, giving a real training signal.
+When V_raw gets small enough (|V_element| < δ), it transitions to MSE for fine tuning.
+
+**Result**: Pending — run with `python train.py --config configs/debug.yaml`
+
+---
+
+### Current debug config (`configs/debug.yaml`)
+```
+generator: hidden_dim=128, 2 layers, 2 heads
+data: seq_len=32, 1000 samples
+training: batch=8, lr=3e-5, grad_clip=0.5, diversity_weight=0.1
+drifting: momentum=0.9, normalize_drift=false, loss_fn=huber, huber_delta=1.0
+inference: prompt="Once upon a time "
+```
+
+### Key metrics to watch
+- `V_raw`: should DECREASE over training (= model improving)
+- `V` = V_raw (no clamp now): loss tracks this directly
+- `total_loss`: should decrease linearly with V_raw (Huber regime)
+- `grad_norm`: should be bounded even with large V (linear region)
+- `div` (gen_diversity): should stay > 0

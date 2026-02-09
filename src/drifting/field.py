@@ -19,7 +19,7 @@ def pairwise_l2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     yy = (y * y).sum(dim=-1, keepdim=True)  # (M, 1)
     dist_sq = xx + yy.t() - 2.0 * x @ y.t()  # (N, M)
     dist_sq = dist_sq.clamp(min=0.0)
-    return dist_sq.sqrt()
+    return (dist_sq + 1e-8).sqrt()
 
 
 def compute_V_single_temp(
@@ -27,7 +27,7 @@ def compute_V_single_temp(
     phi_pos: torch.Tensor,
     phi_neg: torch.Tensor,
     tau: float,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     """Compute drifting field V for a single temperature.
 
     Uses double softmax (over positives/negatives, then over generated samples).
@@ -39,7 +39,7 @@ def compute_V_single_temp(
         tau: temperature
 
     Returns:
-        V: (N, C) drifting field for each generated sample
+        dict with "V", "V_attract", "V_repel" — each (N, C)
     """
     N = phi_x.shape[0]
 
@@ -72,7 +72,7 @@ def compute_V_single_temp(
     # Drifting field: attraction - repulsion
     V = V_attract - V_repel
 
-    return V
+    return {"V": V, "V_attract": V_attract, "V_repel": V_repel}
 
 
 def compute_V(
@@ -81,7 +81,7 @@ def compute_V(
     phi_neg: torch.Tensor,
     temperatures: tuple[float, ...] = (0.02, 0.05, 0.2),
     self_mask: bool = True,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     """Compute drifting field V aggregated over multiple temperatures.
 
     Args:
@@ -92,27 +92,29 @@ def compute_V(
         self_mask: if True and phi_neg is phi_x, mask self-distances in repulsion
 
     Returns:
-        V: (N, C) drifting field
+        dict with "V", "V_attract", "V_repel" — each (N, C)
     """
     V = torch.zeros_like(phi_x)
+    V_attract = torch.zeros_like(phi_x)
+    V_repel = torch.zeros_like(phi_x)
 
     for tau in temperatures:
         if self_mask and phi_neg is phi_x:
-            # When negatives are the generated samples themselves,
-            # mask out self-interactions by adding large distance to diagonal
-            V_tau = _compute_V_self_masked(phi_x, phi_pos, tau)
+            result = _compute_V_self_masked(phi_x, phi_pos, tau)
         else:
-            V_tau = compute_V_single_temp(phi_x, phi_pos, phi_neg, tau)
-        V = V + V_tau
+            result = compute_V_single_temp(phi_x, phi_pos, phi_neg, tau)
+        V = V + result["V"]
+        V_attract = V_attract + result["V_attract"]
+        V_repel = V_repel + result["V_repel"]
 
-    return V
+    return {"V": V, "V_attract": V_attract, "V_repel": V_repel}
 
 
 def _compute_V_self_masked(
     phi_x: torch.Tensor,
     phi_pos: torch.Tensor,
     tau: float,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     """Compute V when negatives == generated samples, with self-masking."""
     N, C = phi_x.shape
 
@@ -145,4 +147,4 @@ def _compute_V_self_masked(
     # Repulsion
     V_repel = w_neg @ phi_x - phi_x
 
-    return V_attract - V_repel
+    return {"V": V_attract - V_repel, "V_attract": V_attract, "V_repel": V_repel}
