@@ -128,7 +128,157 @@ Huber(V) = |V| - δ/2 for large V gives constant-magnitude gradients. As V_raw
 decreases during training, loss decreases linearly, giving a real training signal.
 When V_raw gets small enough (|V_element| < δ), it transitions to MSE for fine tuning.
 
-**Result**: Pending — run with `python train.py --config configs/debug.yaml`
+**Result**: Best run yet. Three phases:
+- Steps 10-80:  loss 4.2→1.5, V_raw 184→47. Genuine learning.
+- Steps 80-150: loss 1.5-2.0, V_raw 40-50. Oscillating but holding.
+- Steps 150-500: loss slowly climbs 2.0→3.4, V_raw drifts to 50-70.
+
+Grad norms bounded at 3-10 (vs 100-600 in MSE experiments). No NaN, no explosion,
+no collapse (diversity 11-17 throughout). Huber loss solved the gradient problem.
+
+Loss climb in phase 3 is likely batch noise: batch_size=8 sees only 0.8% of the 1000
+samples per step. Once V_raw is ~40, the per-step signal is small relative to batch
+variance — model can't hold its position. vocab_dist stable at 18-21 (vs 103 at
+original collapse). Samples still gibberish but diverse, no single-token repetition.
+
+**Verdict**: Training mechanics are sound. Ready to scale up (larger batch, more data).
+
+---
+
+### Summary of fixes applied (experiments 1-6)
+
+| Fix | File | Effect |
+|-----|------|--------|
+| `(dist_sq + 1e-8).sqrt()` | field.py | Eliminated NaN from sqrt(0) gradient |
+| Grad clip on all params | train.py | Prevented unclipped projection gradients |
+| Diversity regularizer | train.py | Anti-collapse penalty on generator output |
+| Split attract/repel tracking | field.py, loss.py | Diagnose field imbalance |
+| V_raw, drift_lambda logging | loss.py, train.py | See normalizer behavior |
+| `normalize_drift: false` | loss.py | Avoid EMA lag making loss uninformative |
+| Huber loss (`loss_fn: huber`) | loss.py | Linear gradient for large V, no explosion |
+
+---
+
+### Experiment 7: Gradient accumulation (accum=4, batch=8, lr=1e-5)
+**Config**: debug.yaml with `gradient_accumulation: 4`, `lr: 1e-5`
+**Changes**: Added gradient accumulation to training loop (micro-batch inner loop).
+Effective batch=32 (4 × 8). Also lowered LR from 3e-5 to 1e-5.
+
+**Result**: Same pattern. Loss drops 4.5→2.3 (steps 10-150), then climbs back to
+4.0+ by step 260. V_raw drops 184→72, then climbs to 88. Grad norms much smoother
+(2-15) but the V field still oscillates.
+
+**Root cause**: Gradient accumulation averages the GRADIENTS across micro-batches, but
+within each micro-batch, V is still computed on only 8×8 pairwise distances (7 negatives
+per sample). The softmax weights over 7 points are inherently unstable — a few outlier
+points dominate. The V FIELD is noisy, not just the gradient.
+
+---
+
+### Experiment 8: Larger batch for stable V field
+**Config**: debug.yaml with `batch_size: 16`, `n_pos: 16`, `gradient_accumulation: 1`
+**Changes**: Increased batch from 8→16, removed gradient accumulation. Now V is
+computed on a 16×16 pairwise matrix with 15 negatives per sample (vs 7 before).
+
+**Rationale**: The softmax over 15 negatives is much more stable than over 7. The
+pairwise distance matrix has 240 off-diagonal entries (vs 56 with batch=8) — 4x more
+information for the field computation. This directly reduces V field variance.
+
+Still fits on Mac: 16 samples × 32 tokens × GPT-2 forward = modest memory.
+
+**Result**: Smoother than batch=8 but same pattern:
+- Steps 10-100: loss 4.5→3.6, V_raw 186→163 (slow start)
+- Steps 100-230: loss 3.6→1.8, V_raw 163→60 (real learning)
+- Steps 230-500: loss climbs 1.8→3.8, V_raw oscillates 50-78
+
+Critical observation at late phase (steps 400-500): LR drops from 1.3e-6→1e-7 (model
+nearly frozen), yet V_raw still bounces 56→78→62→72→73→60→75→64→67→66. This is PURE
+MEASUREMENT NOISE — the model isn't changing, but each batch gives a different V field.
+
+**Conclusion**: The "climb" is a mix of real drift (steps 280-350 when LR was ~3-5e-6)
+and V field batch variance (~±15 V_raw). The raw per-step loss can't distinguish real
+degradation from measurement noise. Need EMA-smoothed metrics.
+
+---
+
+### Experiment 9: EMA-smoothed loss metric
+**Config**: same as exp 8, but with `ema_loss` tracked in the log
+**Changes**: Added EMA-smoothed loss (α=0.05) logged as `ema=` alongside raw loss.
+Updated every step (not just at log intervals). This shows the real trend through
+the batch noise.
+
+**Result**: EMA confirms the loss climb is real, not just noise:
+- Steps 110-230: ema drops 3.72→2.05 (genuine learning)
+- Steps 230-310: ema hovers 2.05-2.12 (near-plateau)
+- Steps 310-500: ema climbs steadily 2.12→3.32 (real degradation)
+
+**Root cause**: The V field is non-stationary. Unlike supervised learning where the
+target is fixed, V depends on the current model (negatives = generated samples). When
+the model drifts slightly off-optimal, the negative distribution shifts → V changes →
+model drifts further. It's the same feedback loop as the original collapse, just damped
+by Huber loss and diversity regularization. Also, the frozen GPT-2 feature space isn't
+locally smooth — small perturbations in generator output can cause discontinuous jumps
+in encoder features, making V unreliable near the real manifold.
+
+**Informed by**: "Challenges of Diffusion Language Models" blog post (spacehunterinf).
+Key parallel: SLD (Segment-Level Diffusion) identifies three essential properties for
+latent-space generation: low conversion error, local smoothness, distributional
+smoothness. Our frozen GPT-2 features lack local smoothness — not designed for it.
+
+---
+
+### Experiment 10: Smooth projection + noise augmentation
+**Config**: debug.yaml with `smooth_proj` enabled
+**Changes**:
+- Added `SmoothProjectionBank` (src/drifting/smooth_proj.py): learned MLP per feature
+  scale that projects pooled encoder features (768/1536-dim) to a lower-dim (256) smooth
+  space before the drifting loss
+- Noise augmentation: Gaussian noise (σ=0.1) added to encoder features before projection,
+  so the V field sees a smoothed version of the landscape
+- Lipschitz smoothness penalty: ||proj(x+ε) - proj(x)||²/||ε||² penalizes projections
+  that amplify perturbations (weight=0.01)
+- Projection MLPs trained jointly with generator via drifting loss gradients
+
+**Rationale**: The frozen GPT-2 feature space has sharp boundaries — small input changes
+can cause large feature jumps. The learned projection smooths this out: (1) noise
+augmentation prevents the V field from relying on sharp features, (2) the Lipschitz
+penalty trains the projection to be contractive, (3) the lower dimensionality (256 vs
+768/1536) removes high-frequency noise dimensions. This directly addresses the late-phase
+instability where V becomes unreliable near the real manifold.
+
+**Result**: Best stability yet. Dramatically reduced late-phase climb:
+- Steps 10-100:  ema 57→45, V_raw 77→61. Warmup phase.
+- Steps 100-250: ema 45→12.6, V_raw 61→21. Strong learning (loss drops 4.5x).
+- Steps 250-320: ema 12.6-12.9. **Clean plateau** — first time holding steady.
+- Steps 320-500: ema 12.9→14.4. Gentle drift (14% from min vs 62% in exp 9).
+
+V_raw stabilized at 22-26 during plateau (vs oscillating 50-80 without smooth proj).
+Attract/repel ratio improved to ~3:1 (a=25, r=9) from ~8:1. Smooth loss rock-steady
+at 0.012 throughout — Lipschitz constraint learned immediately, no conflict.
+
+Grad norms 30-190 pre-clip (0.5 clip doing heavy work). Diversity healthy at 13-17.
+Vocab distances stable ~20 (vs 103 at original collapse).
+
+Samples still gibberish but diverse — expected at this model scale (128-dim, 2 layers).
+
+**Verdict**: Smooth projection solved the late-phase instability. The V field is now
+stable enough for the model to hold a plateau. Ready to scale up.
+
+---
+
+### Summary of fixes applied (experiments 1-10)
+
+| Fix | File | Effect |
+|-----|------|--------|
+| `(dist_sq + 1e-8).sqrt()` | field.py | Eliminated NaN from sqrt(0) gradient |
+| Grad clip on all params | train.py | Prevented unclipped projection gradients |
+| Diversity regularizer | train.py | Anti-collapse penalty on generator output |
+| Split attract/repel tracking | field.py, loss.py | Diagnose field imbalance |
+| V_raw, drift_lambda logging | loss.py, train.py | See normalizer behavior |
+| `normalize_drift: false` | loss.py | Avoid EMA lag making loss uninformative |
+| Huber loss (`loss_fn: huber`) | loss.py | Linear gradient for large V, no explosion |
+| EMA-smoothed loss tracking | train.py | See real trend through batch noise |
+| Smooth projection + noise aug | smooth_proj.py, train.py | Stable V field near manifold |
 
 ---
 
@@ -136,14 +286,18 @@ When V_raw gets small enough (|V_element| < δ), it transitions to MSE for fine 
 ```
 generator: hidden_dim=128, 2 layers, 2 heads
 data: seq_len=32, 1000 samples
-training: batch=8, lr=3e-5, grad_clip=0.5, diversity_weight=0.1
+training: batch=16, n_pos=16, lr=1e-5, grad_clip=0.5, diversity_weight=0.1
 drifting: momentum=0.9, normalize_drift=false, loss_fn=huber, huber_delta=1.0
+smooth_proj: proj_dim=256, feature_noise=0.1, smoothness_weight=0.01
 inference: prompt="Once upon a time "
 ```
 
-### Key metrics to watch
-- `V_raw`: should DECREASE over training (= model improving)
-- `V` = V_raw (no clamp now): loss tracks this directly
-- `total_loss`: should decrease linearly with V_raw (Huber regime)
-- `grad_norm`: should be bounded even with large V (linear region)
-- `div` (gen_diversity): should stay > 0
+### Key insights
+1. V field batch variance is ~±15 V_raw even with a frozen model. With batch=16, the
+   per-step loss has a noise floor of ~±1.0. Any trend must be read through this noise
+   using smoothing. Raw per-step loss is misleading for training health assessment.
+2. Feature space smoothness is critical for stable V fields. Frozen encoder features
+   aren't designed for local smoothness — learned projections with Lipschitz constraints
+   can fix this (inspired by SLD's approach to latent-space diffusion).
+3. The attract/repel ratio is a good health indicator. ~3:1 is healthy; ~8:1+ means
+   repulsion is too weak to balance attraction (likely due to noisy V field).

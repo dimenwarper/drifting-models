@@ -30,15 +30,24 @@ drifting:
   loss_fn: "huber"
   huber_delta: 1.0
 
+smooth_proj:
+  enabled: true
+  proj_dim: 256
+  hidden_mult: 2
+  feature_noise_std: 0.1       # noise added to encoder features before projection
+  smoothness_weight: 0.01      # Lipschitz penalty weight
+  lipschitz_noise_std: 0.1     # perturbation size for smoothness loss
+
 training:
-  batch_size: 8
-  n_pos: 8
+  batch_size: 16
+  n_pos: 16
   queue_size: 512
   max_steps: 500
   diversity_weight: 0.1
+  gradient_accumulation: 1
 
   optimizer:
-    lr: 3.0e-5
+    lr: 1.0e-5
     betas: [0.9, 0.95]
     weight_decay: 0.05
 

@@ -17,6 +17,7 @@ from src.features.encoder import GPT2FeatureEncoder
 from src.features.pooling import TextFeaturePooler, pool_features
 from src.drifting.loss import DriftingLoss
 from src.drifting.field import pairwise_l2
+from src.drifting.smooth_proj import SmoothProjectionBank
 from src.data.dataset import TinyStoriesDataset
 from src.data.queue import SampleQueue
 from src.inference.decode import decode_to_text, compute_vocab_distances
@@ -132,6 +133,8 @@ def train(config_path: str = "configs/default.yaml"):
         n_params += sum(p.numel() for p in prefix_proj.parameters())
     logger.info(f"Generator parameters: {n_params:,}")
 
+    # (smooth_proj params counted after initialization, since it's lazily built)
+
     # EMA model
     ema_generator = copy.deepcopy(generator)
     ema_generator.eval()
@@ -154,6 +157,16 @@ def train(config_path: str = "configs/default.yaml"):
         loss_fn=cfg["drifting"].get("loss_fn", "mse"),
         huber_delta=cfg["drifting"].get("huber_delta", 1.0),
     )
+
+    # Smooth projection (learned feature space regularization)
+    smooth_cfg = cfg.get("smooth_proj", {})
+    smooth_proj = None
+    if smooth_cfg.get("enabled", False):
+        smooth_proj = SmoothProjectionBank(
+            proj_dim=smooth_cfg.get("proj_dim", 256),
+            hidden_mult=smooth_cfg.get("hidden_mult", 2),
+        ).to(device)
+        logger.info(f"Smooth projection enabled: proj_dim={smooth_cfg.get('proj_dim', 256)}")
 
     # Dataset and DataLoader
     logger.info("Loading dataset...")
@@ -184,6 +197,8 @@ def train(config_path: str = "configs/default.yaml"):
         opt_params += list(embed_proj.parameters())
     if prefix_proj is not None:
         opt_params += list(prefix_proj.parameters())
+    if smooth_proj is not None:
+        opt_params += list(smooth_proj.parameters())
     optimizer = torch.optim.AdamW(
         opt_params,
         lr=opt_cfg["lr"],
@@ -213,87 +228,130 @@ def train(config_path: str = "configs/default.yaml"):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     data_iter = iter(dataloader)
-    logger.info("Starting training...")
+    accum_steps = tc.get("gradient_accumulation", 1)
+    logger.info(f"Starting training... (gradient_accumulation={accum_steps})")
+
+    B = tc["batch_size"]
+    ema_loss = None  # EMA-smoothed loss for tracking real trend
+    ema_V_raw = None
+    S = cfg["data"]["seq_len"]
+    C = cfg["generator"]["hidden_dim"]
 
     for step in range(1, tc["max_steps"] + 1):
-        # Get batch of real data
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
-
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-
         # LR schedule
         lr_scale = cosine_lr(step, sc["warmup_steps"], tc["max_steps"], sc["min_lr_ratio"])
         for pg in optimizer.param_groups:
             pg["lr"] = opt_cfg["lr"] * lr_scale
 
-        # Generate samples
-        B = tc["batch_size"]
-        S = cfg["data"]["seq_len"]
-        C = cfg["generator"]["hidden_dim"]
-
-        # Prompt conditioning: random prefix split
-        prefix_len = 0
-        prefix_embeds_gen = None
-        if use_prefix:
-            prefix_len = random.randint(min_prefix, min(max_prefix, S - 1))
-            with torch.no_grad():
-                prefix_embeds = encoder.embed_tokens(input_ids[:B, :prefix_len])  # (B, P, 768)
-            if prefix_proj is not None:
-                prefix_embeds_gen = prefix_proj(prefix_embeds.detach())
-            else:
-                prefix_embeds_gen = prefix_embeds.detach()
-
-        suffix_len = S - prefix_len
-        noise = torch.randn(B, suffix_len, C, device=device)
-
-        gen_out = generator(noise, prefix_embeds=prefix_embeds_gen)  # (B, P+suffix, C)
-
-        # Slice suffix only for feature extraction
-        suffix_out = gen_out[:, prefix_len:]  # (B, suffix_len, C)
-
-        # Project to encoder dim if needed
-        enc_input = embed_proj(suffix_out) if embed_proj is not None else suffix_out
-
-        # Extract features — no_grad for real data, grad for generated (to backprop to generator)
-        suffix_ids = input_ids[:, prefix_len:]
-        suffix_mask = attention_mask[:, prefix_len:]
-        with torch.no_grad():
-            with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
-                real_features = encoder(input_ids=suffix_ids, attention_mask=suffix_mask)
-        with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
-            gen_features = encoder(inputs_embeds=enc_input, attention_mask=None)
-
-        # Pool features (suffix only — already sliced)
-        real_pooled = pool_features(real_features, pooler, suffix_mask)
-        gen_pooled = pool_features(gen_features, pooler, None)
-
-        # Compute drifting loss (in fp32)
-        loss, metrics = drifting_loss.compute(
-            gen_features=gen_pooled,
-            pos_features=real_pooled,
-            neg_features=None,  # use gen_features as negatives
-        )
-
-        # Diversity regularizer — penalize collapse in generator output space
-        diversity_weight = tc.get("diversity_weight", 0.0)
-        if diversity_weight > 0:
-            gen_flat = suffix_out.mean(dim=1)  # (B, C) — per-sample mean embedding
-            pw_dist = pairwise_l2(gen_flat, gen_flat)  # (B, B)
-            eye_mask = ~torch.eye(B, device=device, dtype=torch.bool)
-            avg_dist = pw_dist[eye_mask].mean()
-            diversity_loss = 1.0 / (avg_dist + 1e-4)
-            loss = loss + diversity_weight * diversity_loss
-            metrics["gen_diversity"] = avg_dist.item()
-            metrics["diversity_loss"] = diversity_loss.item()
-
-        # Backward
         optimizer.zero_grad()
-        loss.backward()
+        accum_metrics = {}
+
+        for micro in range(accum_steps):
+            # Get batch of real data
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            # Prompt conditioning: random prefix split
+            prefix_len = 0
+            prefix_embeds_gen = None
+            if use_prefix:
+                prefix_len = random.randint(min_prefix, min(max_prefix, S - 1))
+                with torch.no_grad():
+                    prefix_embeds = encoder.embed_tokens(input_ids[:B, :prefix_len])
+                if prefix_proj is not None:
+                    prefix_embeds_gen = prefix_proj(prefix_embeds.detach())
+                else:
+                    prefix_embeds_gen = prefix_embeds.detach()
+
+            suffix_len = S - prefix_len
+            noise = torch.randn(B, suffix_len, C, device=device)
+
+            gen_out = generator(noise, prefix_embeds=prefix_embeds_gen)
+            suffix_out = gen_out[:, prefix_len:]
+
+            # Project to encoder dim if needed
+            enc_input = embed_proj(suffix_out) if embed_proj is not None else suffix_out
+
+            # Extract features
+            suffix_ids = input_ids[:, prefix_len:]
+            suffix_mask = attention_mask[:, prefix_len:]
+            with torch.no_grad():
+                with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
+                    real_features = encoder(input_ids=suffix_ids, attention_mask=suffix_mask)
+            with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
+                gen_features = encoder(inputs_embeds=enc_input, attention_mask=None)
+
+            # Pool features
+            real_pooled = pool_features(real_features, pooler, suffix_mask)
+            gen_pooled = pool_features(gen_features, pooler, None)
+
+            # Noise augmentation + smooth projection
+            if smooth_proj is not None:
+                feat_noise_std = smooth_cfg.get("feature_noise_std", 0.1)
+                if feat_noise_std > 0:
+                    real_pooled = [
+                        (name, feat.detach() + torch.randn_like(feat) * feat_noise_std)
+                        for name, feat in real_pooled
+                    ]
+                    gen_pooled = [
+                        (name, feat + torch.randn_like(feat) * feat_noise_std)
+                        for name, feat in gen_pooled
+                    ]
+                # Project to smooth space (before drifting loss)
+                real_pooled = smooth_proj(real_pooled)
+                gen_pooled = smooth_proj(gen_pooled)
+
+            # Compute drifting loss (in fp32)
+            loss, metrics = drifting_loss.compute(
+                gen_features=gen_pooled,
+                pos_features=real_pooled,
+                neg_features=None,
+            )
+
+            # Smoothness regularizer
+            if smooth_proj is not None:
+                smooth_weight = smooth_cfg.get("smoothness_weight", 0.01)
+                if smooth_weight > 0:
+                    # Recompute on clean (un-noised) pooled features
+                    clean_pooled = pool_features(real_features, pooler, suffix_mask)
+                    s_loss = smooth_proj.smoothness_loss(
+                        clean_pooled,
+                        noise_std=smooth_cfg.get("lipschitz_noise_std", 0.1),
+                    )
+                    loss = loss + smooth_weight * s_loss
+                    metrics["smooth_loss"] = s_loss.item()
+
+            # Diversity regularizer
+            diversity_weight = tc.get("diversity_weight", 0.0)
+            if diversity_weight > 0:
+                gen_flat = suffix_out.mean(dim=1)
+                pw_dist = pairwise_l2(gen_flat, gen_flat)
+                eye_mask = ~torch.eye(B, device=device, dtype=torch.bool)
+                avg_dist = pw_dist[eye_mask].mean()
+                diversity_loss = 1.0 / (avg_dist + 1e-4)
+                loss = loss + diversity_weight * diversity_loss
+                metrics["gen_diversity"] = avg_dist.item()
+                metrics["diversity_loss"] = diversity_loss.item()
+
+            # Scale loss for accumulation and backward
+            (loss / accum_steps).backward()
+
+            # Accumulate metrics (average across micro-steps)
+            for k, v in metrics.items():
+                accum_metrics[k] = accum_metrics.get(k, 0.0) + v / accum_steps
+
+            # Push real embeddings to queue
+            with torch.no_grad():
+                real_embeds = encoder.embed_tokens(input_ids)
+                queue.push(real_embeds.mean(dim=1))
+
+        metrics = accum_metrics
 
         # Gradient clipping (all trainable params, including projections)
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -306,10 +364,10 @@ def train(config_path: str = "configs/default.yaml"):
         # EMA update
         update_ema(ema_generator, generator, tc["ema_decay"])
 
-        # Push real embeddings to queue
-        with torch.no_grad():
-            real_embeds = encoder.embed_tokens(input_ids)
-            queue.push(real_embeds.mean(dim=1))  # global mean as summary
+        # Update smoothed metrics (every step, not just log steps)
+        _ema_alpha = 0.05  # smoothing factor — lower = smoother
+        cur_loss = metrics["total_loss"]
+        ema_loss = cur_loss if ema_loss is None else (1 - _ema_alpha) * ema_loss + _ema_alpha * cur_loss
 
         # Logging
         if step % tc["log_interval"] == 0:
@@ -324,9 +382,11 @@ def train(config_path: str = "configs/default.yaml"):
             repel_norms = [v for k, v in metrics.items() if k.endswith("/repulsion_norm")]
             drift_lambdas = [v for k, v in metrics.items() if k.endswith("/drift_lambda")]
 
+            metrics["ema_loss"] = ema_loss
             diag_parts = [
                 f"loss={metrics['total_loss']:.4f}",
-                f"grad_norm={metrics['grad_norm']:.3f}",
+                f"ema={ema_loss:.4f}",
+                f"grad={metrics['grad_norm']:.1f}",
                 f"lr={lr:.2e}",
             ]
             if v_norms:
@@ -351,6 +411,8 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"r={metrics['mean_repulsion_norm']:.1f}")
             if "gen_diversity" in metrics:
                 diag_parts.append(f"div={metrics['gen_diversity']:.1f}")
+            if "smooth_loss" in metrics:
+                diag_parts.append(f"smooth={metrics['smooth_loss']:.3f}")
 
             logger.info(f"Step {step} | {' | '.join(diag_parts)}")
 
@@ -399,6 +461,8 @@ def train(config_path: str = "configs/default.yaml"):
                 ckpt["embed_proj"] = embed_proj.state_dict()
             if prefix_proj is not None:
                 ckpt["prefix_proj"] = prefix_proj.state_dict()
+            if smooth_proj is not None:
+                ckpt["smooth_proj"] = smooth_proj.state_dict()
             path = checkpoint_dir / f"step_{step:07d}.pt"
             torch.save(ckpt, path)
             logger.info(f"Saved checkpoint: {path}")
