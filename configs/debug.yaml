@@ -44,6 +44,7 @@ training:
   queue_size: 512
   max_steps: 500
   diversity_weight: 0.1
+  vocab_anchor_weight: 1.0      # keep generator output near valid tokens
   gradient_accumulation: 1
 
   optimizer:

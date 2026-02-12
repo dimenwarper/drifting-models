@@ -237,6 +237,9 @@ def train(config_path: str = "configs/default.yaml"):
     S = cfg["data"]["seq_len"]
     C = cfg["generator"]["hidden_dim"]
 
+    # Pre-move vocab embeddings to device for vocab anchoring loss
+    vocab_embs_device = vocab_embeddings.to(device) if tc.get("vocab_anchor_weight", 0.0) > 0 else None
+
     for step in range(1, tc["max_steps"] + 1):
         # LR schedule
         lr_scale = cosine_lr(step, sc["warmup_steps"], tc["max_steps"], sc["min_lr_ratio"])
@@ -339,6 +342,27 @@ def train(config_path: str = "configs/default.yaml"):
                 metrics["gen_diversity"] = avg_dist.item()
                 metrics["diversity_loss"] = diversity_loss.item()
 
+            # Vocab anchoring — keep generator output near valid token embeddings
+            vocab_weight = tc.get("vocab_anchor_weight", 0.0)
+            if vocab_weight > 0:
+                # enc_input: (B, suffix_len, enc_dim) — generator output in encoder space
+                flat_emb = enc_input.reshape(-1, enc_input.shape[-1])  # (B*S, enc_dim)
+                # Compute distance to nearest vocab token for each position
+                # Use chunked computation to avoid OOM on large vocab (50257)
+                chunk_size = tc.get("vocab_anchor_chunk", 0)
+                if chunk_size > 0:
+                    min_dists = []
+                    for i in range(0, flat_emb.shape[0], chunk_size):
+                        chunk = flat_emb[i:i + chunk_size]
+                        dists = torch.cdist(chunk, vocab_embs_device)  # (chunk, V)
+                        min_dists.append(dists.min(dim=-1).values)
+                    min_vocab_dist = torch.cat(min_dists).mean()
+                else:
+                    dists = torch.cdist(flat_emb, vocab_embs_device)  # (B*S, V)
+                    min_vocab_dist = dists.min(dim=-1).values.mean()
+                loss = loss + vocab_weight * min_vocab_dist
+                metrics["vocab_anchor"] = min_vocab_dist.item()
+
             # Scale loss for accumulation and backward
             (loss / accum_steps).backward()
 
@@ -413,6 +437,8 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"div={metrics['gen_diversity']:.1f}")
             if "smooth_loss" in metrics:
                 diag_parts.append(f"smooth={metrics['smooth_loss']:.3f}")
+            if "vocab_anchor" in metrics:
+                diag_parts.append(f"vanc={metrics['vocab_anchor']:.1f}")
 
             logger.info(f"Step {step} | {' | '.join(diag_parts)}")
 

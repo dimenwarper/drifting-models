@@ -67,6 +67,7 @@ training:
     min_lr_ratio: 0.01      # min_lr = lr * min_lr_ratio
 
   diversity_weight: 0.1     # anti-collapse regularizer (exp 1)
+  vocab_anchor_weight: 1.0  # keep generator output near valid tokens (exp 11)
   gradient_clip: 0.5        # tight clip needed — grad norms can spike (exp 2)
   ema_decay: 0.999
   precision: "bf16"          # bf16 for GPT-2 forward, fp32 for loss
