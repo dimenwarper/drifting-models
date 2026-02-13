@@ -45,6 +45,8 @@ training:
   max_steps: 500
   diversity_weight: 0.1
   vocab_anchor_weight: 1.0      # keep generator output near valid tokens
+  use_random_neg: true           # SDDLM-style: random vocab tokens as negatives
+  n_random_neg: 16               # number of random negative sequences per step
   gradient_accumulation: 1
 
   optimizer:

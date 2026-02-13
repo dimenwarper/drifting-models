@@ -339,3 +339,85 @@ inference: prompt="Once upon a time "
 4. Loss in projected space can decouple from generation quality. Vocab anchoring is
    essential to keep the generator on the valid token manifold (the "rounding error"
    problem from diffusion LM literature).
+
+---
+
+### Production run (experiment 12): Vocab anchoring works, diversity still collapses
+**Config**: default.yaml (768-dim, 12 layers, batch=64, lr=1e-4, vocab_anchor_weight=1.0, diversity_weight=5.0)
+**Result**: Vocab anchoring solved the off-manifold problem (vanc dropped 70→2.6, tokens are real words).
+BUT diversity still collapsed: div dropped 88→1.5 even with diversity_weight=5.0.
+Generated samples: "iiiii...", "is is is...", "when when when..." — valid tokens but all identical.
+
+**Root cause**: The `1/(avg_dist + 1e-4)` diversity regularizer fundamentally fails:
+- Wrong gradient shape: ∇(1/x) = -1/x² is too gentle when x is large (diversity healthy)
+  and too aggressive when x is tiny (already collapsed, can't recover)
+- Critical collapse window (div 88→10) has near-zero penalty — by the time div<1 makes
+  penalty spike, model is in a collapse basin it can't escape
+- Chicken-and-egg: self-contrastive repulsion needs diversity, diversity needs repulsion.
+  When both fail simultaneously, no force can restore diversity.
+
+---
+
+### Deep research: Model collapse in diffusion language models
+
+Literature survey of techniques used in production diffusion LMs to prevent mode collapse:
+
+**1. SDDLM negative gradient regularization** (Semi-autoregressive Discrete Diffusion LM)
+- Instead of self-contrastive repulsion (which fails during collapse), sample RANDOM vocab
+  tokens as explicit negatives with repulsive gradients
+- gradient = -∇_θ score(positive) + E_{neg ~ Uniform(V)} ∇_θ score(negative)
+- Random negatives are always diverse regardless of generator state → collapse-independent
+- Scales to 1.1B parameters
+
+**2. MoCo-style queue decoupling** (Momentum Contrast for language generation)
+- FIFO queue of past generated features as negatives, updated with momentum encoder
+- Decouples negative quality from current model state — stale negatives from diverse
+  past prevent collapse even as current batch collapses
+- Queue size 65536+, momentum decay 0.999
+
+**3. Spectral regularization** (various diffusion model papers)
+- Penalize top singular values of generator weight matrices
+- Prevents rank collapse where all outputs lie in a low-dim subspace
+- Complementary to other approaches
+
+**4. EMA self-distillation** (consistency models, DDIM)
+- Use EMA model to generate targets/negatives
+- EMA model changes slowly → provides stable, diverse reference
+- Already have EMA infrastructure, could be leveraged
+
+**5. Diffusion-LM clamping trick** (Li et al., 2022)
+- During decoding, map predicted continuous vectors to nearest word embeddings
+- Forces commitment to discrete tokens, prevents drifting into off-manifold space
+- Complementary to vocab anchoring (which penalizes distance during training)
+
+**Plan**: Try approach 1 (SDDLM random negatives) first — most targeted fix for our
+self-contrastive collapse problem. If that fails, try 5 (clamping trick). If that fails,
+try 2 (MoCo queue).
+
+---
+
+### Experiment 13: SDDLM-style random negative repulsion
+**Config**: debug.yaml with `use_random_neg: true`, `n_random_neg: 16`
+**Changes**:
+- Replace self-contrastive negatives with random vocab token sequences
+- Each step: sample n_random_neg random token sequences, encode through frozen GPT-2,
+  pool features, project through smooth_proj, use as neg_features in drifting loss
+- V field becomes: attract(to real) - repel(from random tokens)
+- Repulsion is ALWAYS well-defined regardless of generator diversity
+- Random tokens represent "where we don't want to be" (incoherent word combinations)
+- Keep diversity regularizer as secondary signal
+
+**Result**: Best run yet. No late-phase climb, diversity maintained throughout:
+- Steps 10-50:  ema 1.55→1.54, warmup. div 12-15, vanc 17-19.
+- Steps 50-250: ema 1.54→1.14, genuine learning. div 11-13.
+- Steps 250-500: ema 1.14→1.02, continued improvement (no plateau/climb!). div 10-12.
+
+Attract/repel ratio ~1:1 (vs ~3:1 with self-contrastive) — random negatives provide much
+stronger, more consistent repulsion. EMA loss is monotonically decreasing throughout 500
+steps — first time we've seen this. No collapse, no divergence, no late-phase degradation.
+
+Generated samples still gibberish (debug scale: 128-dim, 2 layers) but diverse — no
+single-token repetition. vocab_dist dropping 20→16 (on-manifold). rneg ~165 (gen far from
+random tokens = not producing garbage).
+
+**Verdict**: Random negatives solve the collapse problem. Ready for production test.

@@ -295,6 +295,7 @@ def train(config_path: str = "configs/default.yaml"):
             gen_pooled = pool_features(gen_features, pooler, None)
 
             # Noise augmentation + smooth projection
+            feat_noise_std = 0.0
             if smooth_proj is not None:
                 feat_noise_std = smooth_cfg.get("feature_noise_std", 0.1)
                 if feat_noise_std > 0:
@@ -310,12 +311,42 @@ def train(config_path: str = "configs/default.yaml"):
                 real_pooled = smooth_proj(real_pooled)
                 gen_pooled = smooth_proj(gen_pooled)
 
+            # SDDLM-style random negative repulsion:
+            # Sample random vocab token sequences as negatives instead of self-contrastive.
+            # Random negatives provide collapse-independent repulsion.
+            neg_pooled = None  # None = self-contrastive (default)
+            if tc.get("use_random_neg", False):
+                n_rand = tc.get("n_random_neg", B)
+                rand_ids = torch.randint(
+                    0, vocab_embeddings.shape[0], (n_rand, suffix_len), device=device
+                )
+                with torch.no_grad():
+                    with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
+                        rand_features = encoder(input_ids=rand_ids, attention_mask=None)
+                neg_pooled = pool_features(rand_features, pooler, None)
+                if smooth_proj is not None:
+                    if feat_noise_std > 0:
+                        neg_pooled = [
+                            (name, feat + torch.randn_like(feat) * feat_noise_std)
+                            for name, feat in neg_pooled
+                        ]
+                    with torch.no_grad():
+                        neg_pooled = smooth_proj(neg_pooled)
+
             # Compute drifting loss (in fp32)
             loss, metrics = drifting_loss.compute(
                 gen_features=gen_pooled,
                 pos_features=real_pooled,
-                neg_features=None,
+                neg_features=neg_pooled,
             )
+
+            # Log mean distance to random negatives (for monitoring)
+            if neg_pooled is not None:
+                with torch.no_grad():
+                    rn_dists = []
+                    for (_, phi_g), (_, phi_r) in zip(gen_pooled, neg_pooled):
+                        rn_dists.append(pairwise_l2(phi_g, phi_r).mean().item())
+                    metrics["rand_neg"] = sum(rn_dists) / len(rn_dists)
 
             # Smoothness regularizer
             if smooth_proj is not None:
@@ -439,6 +470,8 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"smooth={metrics['smooth_loss']:.3f}")
             if "vocab_anchor" in metrics:
                 diag_parts.append(f"vanc={metrics['vocab_anchor']:.1f}")
+            if "rand_neg" in metrics:
+                diag_parts.append(f"rneg={metrics['rand_neg']:.1f}")
 
             logger.info(f"Step {step} | {' | '.join(diag_parts)}")
 
