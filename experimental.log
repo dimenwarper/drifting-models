@@ -800,3 +800,109 @@ coherent text are orthogonal problems. Experiments 15-17 solved collapse but pro
 garbage; experiments 18-19 added token-level signals but these were gamed by the generator.
 The continuous embedding space has too many degenerate solutions that satisfy loss
 constraints without producing meaningful text.
+
+---
+
+### Experiment 20: Gumbel-Softmax token snapping
+
+**Config**: debug_scaled.yaml (384-dim, 4 layers, batch=32, 2000 steps, gumbel_tau=1.0→0.1)
+**Changes**:
+
+Instead of adding more loss constraints, fundamentally change the generator's output
+representation: force it to commit to actual vocab token embeddings using Gumbel-Softmax
+before feeding into GPT-2.
+
+**How it works**:
+1. Generator outputs → embed_proj → continuous enc_input (B, S, 768)
+2. Compute similarities to all vocab tokens: sims = enc_input @ wte.T / tau
+3. Gumbel-Softmax: soft_tokens = GumbelSoftmax(sims, hard=False)
+4. Snap to vocab: enc_input = soft_tokens @ wte (differentiable weighted sum)
+5. Feed snapped embeddings to GPT-2 (now sees near-actual token embeddings)
+
+**Why this should work**:
+- Eliminates the "degenerate continuous solution" problem: the generator MUST produce
+  distributions over real tokens, not arbitrary embedding vectors
+- Features computed on snapped embeddings reflect actual token sequences, not garbage
+- As tau anneals from 1.0 (soft, good gradients) to 0.1 (near-hard, actual tokens),
+  the generator progressively commits to specific token choices
+- The drifting loss now operates on features of real-ish token sequences
+- No need for LM loss, repetition penalty, or vocab anchoring — the constraint is
+  architectural rather than loss-based
+
+**Disabled**: lm_weight=0, rep_penalty_weight=0 (experiments 18-19 showed these
+are gamed by the generator). Kept: drifting loss, diversity reg, spectral reg, smooth_proj.
+Vocab anchoring kept (vocab_anchor_weight=1.0) as sanity check but should be redundant
+with Gumbel-Softmax.
+
+**Expected behavior**:
+- vanc should be very low (embeddings ARE vocab tokens)
+- V field should reflect actual token-level differences between gen and real
+- Grad norms may be higher (Gumbel-Softmax has discrete-like gradients)
+- Samples should show real words (forced by architecture) but may lack coherence
+- gtau= shows annealing progress
+
+**Result** (stopped at step 240 — gradient death):
+
+vanc (ARCHITECTURAL SUCCESS): Dropped to 0.0 by step 140. Gumbel-Softmax forces
+generator output to exact vocab token embeddings — working as designed.
+
+Gradient death (FUNDAMENTAL FAILURE): grad_norm=0.0 from step 140 onward. The Gumbel-
+Softmax over 50k vocab creates near-one-hot distributions because the logit gap between
+the nearest token and the rest is huge (cosine similarity to nearest >> to others). The
+gradient of a peaked softmax is ~0 for all tokens. The generator is completely frozen.
+
+Loss/V: ema plateaued at 6.2-7.1 (10x higher than experiments without Gumbel). V=13-15
+(vs 3-5). a/r ratio extreme: 14:0.6 ≈ 23:1 — repulsion essentially zero.
+
+Generated samples: Real words (forced by architecture) but repetitive word salad:
+- "eg eg eg egura eg eg egura eg eg egura"
+- "selections selections selections choices Choice revolving"
+- No improvement over training (model frozen at step 140)
+
+**Post-mortem — why Gumbel-Softmax fails for large discrete spaces**:
+
+The core issue is that Gumbel-Softmax was designed for small categorical spaces (e.g.,
+10-100 categories) where the logit distribution is relatively flat. For 50k vocab:
+1. The nearest token has logit >> all others (embedding space is sparse)
+2. Softmax saturates to near-one-hot regardless of temperature
+3. Gradient through saturated softmax ≈ 0
+4. No tau value can fix this: too high → random selection, too low → zero gradient
+
+A top-k approximation (Gumbel-Softmax over k=16 nearest tokens) could help, but adds
+complexity and still has the peaked-distribution problem within the top-k.
+
+---
+
+### Meta-analysis: Experiments 15-20 — fundamental architectural limitations
+
+After 6 experiments trying to make the drifting field approach produce coherent text at
+the debug-scaled level (384-dim, 4 layers), the pattern is clear:
+
+**What works**:
+- Collapse prevention (log-barrier diversity + frozen ref)
+- Feature-space matching (V field stable at 3-5 with combined normalizer + V averaging)
+- Vocab proximity (vocab anchoring or Gumbel-Softmax keeps embeddings on-manifold)
+
+**What doesn't work**:
+- ANY approach to making the features correspond to coherent text
+- Auxiliary losses (LM, repetition, perplexity-matching) get gamed
+- Architectural constraints (Gumbel-Softmax) kill gradient flow
+
+**Root cause**: Single-pass generation from noise → tokens is fundamentally limited.
+The generator sees one noise vector and must produce a complete token sequence that
+simultaneously satisfies:
+1. Feature-space proximity to real text (drifting loss)
+2. Token-level validity (vocab anchoring)
+3. Diversity (log-barrier)
+4. Spectral regularity
+
+This is too many constraints for a single forward pass. Successful continuous-space text
+generation (Diffusion-LM, MDLM, SLD) uses ITERATIVE REFINEMENT:
+- Start from noise, take many small steps toward real data
+- Each step can use the current state to make informed updates
+- The iterative process naturally handles the multi-constraint optimization
+
+**Potential next directions**:
+1. Add iterative refinement: multi-step denoising in embedding space (diffusion-style)
+2. Fine-tune GPT-2 with drifting loss at the token level (use GPT-2 as generator, not encoder)
+3. Abandon continuous generation, use drifting field for discrete token scoring

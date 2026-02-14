@@ -294,6 +294,21 @@ def train(config_path: str = "configs/default.yaml"):
             # Project to encoder dim if needed
             enc_input = embed_proj(suffix_out) if embed_proj is not None else suffix_out
 
+            # Gumbel-Softmax snap: force generator to commit to actual vocab tokens
+            gumbel_tau_cfg = tc.get("gumbel_tau", 0.0)
+            cur_gumbel_tau = None
+            if gumbel_tau_cfg > 0:
+                # Anneal temperature: start soft, go hard
+                tau_min = tc.get("gumbel_tau_min", 0.1)
+                tau_progress = step / tc["max_steps"]
+                cur_gumbel_tau = gumbel_tau_cfg + (tau_min - gumbel_tau_cfg) * tau_progress
+                # Compute similarities to vocab embeddings
+                flat = enc_input.reshape(-1, enc_input.shape[-1])  # (B*S, D)
+                sims = flat @ vocab_embs_device.T / cur_gumbel_tau  # (B*S, V)
+                # Gumbel-Softmax: differentiable discrete selection
+                soft_tokens = nn.functional.gumbel_softmax(sims, tau=1.0, hard=False)
+                enc_input = (soft_tokens @ vocab_embs_device).reshape(B, -1, enc_input.shape[-1])
+
             # Extract features
             suffix_ids = input_ids[:, prefix_len:]
             suffix_mask = attention_mask[:, prefix_len:]
@@ -407,6 +422,9 @@ def train(config_path: str = "configs/default.yaml"):
                 s_reg = spectral_regularization(generator)
                 loss = loss + spectral_weight * s_reg
                 metrics["spectral_reg"] = s_reg.item()
+
+            if cur_gumbel_tau is not None:
+                metrics["gumbel_tau"] = cur_gumbel_tau
 
             # GPT-2 perplexity-matching loss — target natural entropy, not minimum
             lm_weight = tc.get("lm_weight", 0.0)
@@ -572,6 +590,8 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"rep={metrics['rep_loss']:.2f}")
             if "rep_cos" in metrics:
                 diag_parts.append(f"rcos={metrics['rep_cos']:.2f}")
+            if "gumbel_tau" in metrics:
+                diag_parts.append(f"gtau={metrics['gumbel_tau']:.2f}")
             if "rand_neg" in metrics:
                 diag_parts.append(f"rneg={metrics['rand_neg']:.1f}")
             if moco_queue is not None:
