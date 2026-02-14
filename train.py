@@ -248,8 +248,10 @@ def train(config_path: str = "configs/default.yaml"):
     S = cfg["data"]["seq_len"]
     C = cfg["generator"]["hidden_dim"]
 
-    # Pre-move vocab embeddings to device for vocab anchoring loss
-    vocab_embs_device = vocab_embeddings.to(device) if tc.get("vocab_anchor_weight", 0.0) > 0 else None
+    # Pre-move vocab embeddings to device for vocab anchoring / LM loss
+    need_vocab = tc.get("vocab_anchor_weight", 0.0) > 0 or tc.get("lm_weight", 0.0) > 0
+    vocab_embs_device = vocab_embeddings.to(device) if need_vocab else None
+    real_ce_ref = None  # Reference CE from real text (for perplexity-matching LM loss)
 
     for step in range(1, tc["max_steps"] + 1):
         # LR schedule
@@ -406,6 +408,61 @@ def train(config_path: str = "configs/default.yaml"):
                 loss = loss + spectral_weight * s_reg
                 metrics["spectral_reg"] = s_reg.item()
 
+            # GPT-2 perplexity-matching loss — target natural entropy, not minimum
+            lm_weight = tc.get("lm_weight", 0.0)
+            if lm_weight > 0:
+                # Compute reference CE from real text (once, frozen)
+                if real_ce_ref is None:
+                    with torch.no_grad():
+                        real_last = real_features[max(real_features.keys())]
+                        real_logits = real_last @ vocab_embs_device.T
+                        real_ce_ref = nn.functional.cross_entropy(
+                            real_logits[:, :-1].reshape(-1, real_logits.shape[-1]),
+                            suffix_ids[:, 1:].reshape(-1),
+                        ).item()
+                    logger.info(f"Real text CE reference: {real_ce_ref:.2f} (ppl={math.exp(real_ce_ref):.1f})")
+
+                # Generated text CE
+                last_hidden = gen_features[max(gen_features.keys())]
+                lm_logits = last_hidden @ vocab_embs_device.T  # (B, S, V)
+                with torch.no_grad():
+                    flat_enc = enc_input.detach().reshape(-1, enc_input.shape[-1])
+                    target_ids = torch.cdist(flat_enc, vocab_embs_device).argmin(dim=-1)
+                    target_ids = target_ids.reshape(B, -1)
+                gen_ce = nn.functional.cross_entropy(
+                    lm_logits[:, :-1].reshape(-1, lm_logits.shape[-1]),
+                    target_ids[:, 1:].reshape(-1),
+                )
+                # Perplexity matching: penalize deviation from real CE
+                lm_loss = (gen_ce - real_ce_ref) ** 2
+                loss = loss + lm_weight * lm_loss
+                metrics["lm_loss"] = lm_loss.item()
+                metrics["gen_ce"] = gen_ce.item()
+
+            # Repetition penalty — penalize consecutive identical nearest-vocab tokens
+            rep_weight = tc.get("rep_penalty_weight", 0.0)
+            if rep_weight > 0:
+                with torch.no_grad():
+                    flat_enc = enc_input.detach().reshape(-1, enc_input.shape[-1])
+                    nearest_ids = torch.cdist(flat_enc, vocab_embs_device).argmin(dim=-1)
+                    nearest_ids = nearest_ids.reshape(B, -1)
+                # Cosine similarity between consecutive token embeddings
+                tok_embs = vocab_embs_device[nearest_ids]  # (B, S, D)
+                cos_sim = nn.functional.cosine_similarity(
+                    tok_embs[:, :-1], tok_embs[:, 1:], dim=-1
+                )  # (B, S-1)
+                # Penalty: encourage low similarity between consecutive positions
+                # Detach targets, gradient flows through enc_input → embed_proj → generator
+                # But nearest_ids are discrete, so we need a differentiable proxy:
+                # penalize enc_input similarity between consecutive positions directly
+                enc_cos = nn.functional.cosine_similarity(
+                    enc_input[:, :-1], enc_input[:, 1:], dim=-1
+                )
+                rep_loss = enc_cos.clamp(min=0.5).mean()  # only penalize high similarity
+                loss = loss + rep_weight * rep_loss
+                metrics["rep_loss"] = rep_loss.item()
+                metrics["rep_cos"] = cos_sim.mean().item()
+
             # Vocab anchoring — keep generator output near valid token embeddings
             vocab_weight = tc.get("vocab_anchor_weight", 0.0)
             if vocab_weight > 0:
@@ -507,6 +564,14 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"dref={metrics['div_ref']:.1f}")
             if "spectral_reg" in metrics:
                 diag_parts.append(f"spec={metrics['spectral_reg']:.3f}")
+            if "lm_loss" in metrics:
+                diag_parts.append(f"lm={metrics['lm_loss']:.2f}")
+            if "gen_ce" in metrics:
+                diag_parts.append(f"ce={metrics['gen_ce']:.2f}")
+            if "rep_loss" in metrics:
+                diag_parts.append(f"rep={metrics['rep_loss']:.2f}")
+            if "rep_cos" in metrics:
+                diag_parts.append(f"rcos={metrics['rep_cos']:.2f}")
             if "rand_neg" in metrics:
                 diag_parts.append(f"rneg={metrics['rand_neg']:.1f}")
             if moco_queue is not None:

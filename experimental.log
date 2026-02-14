@@ -648,3 +648,155 @@ gradient toward producing *coherent text*. The attraction term pulls gen toward 
 but the feature space has many degenerate minima where garbage tokens have similar projected
 features to real text. Without a direct token-level signal (like cross-entropy on actual
 token predictions), the generator will always find these shortcuts.
+
+---
+
+### Experiment 18: GPT-2 fluency loss — direct token coherence signal
+
+**Config**: debug_scaled.yaml (384-dim, 4 layers, batch=32, 2000 steps, lm_weight=1.0)
+**Changes**:
+
+Added GPT-2 fluency loss (LM loss) that gives the generator direct gradient toward
+producing coherent token sequences, addressing the fundamental insight from exp 17:
+contrastive losses alone can't prevent degenerate minima in feature space.
+
+**How it works**:
+1. Generator outputs → embed_proj → frozen GPT-2 → last layer hidden states
+2. LM logits = hidden_states @ wte.T (weight-tied LM head, like GPT-2 pretraining)
+3. Targets = nearest vocab token for each generated embedding position (via cdist)
+4. Loss = shifted cross-entropy: position t predicts position t+1
+5. This gives the generator gradient toward sequences where GPT-2 can predict the next
+   token — i.e., sequences that follow natural language patterns
+
+**Rationale**: The drifting loss operates in 256-dim projected feature space, where
+garbage tokens can have similar features to real text. The LM loss operates at the
+token level (50257-dim logits), where garbage tokens get high cross-entropy because
+GPT-2 can't predict what comes next. These are complementary signals:
+- Drifting loss: "move toward real data distribution in feature space"
+- LM loss: "produce sequences where each token is predictable from context"
+
+**Expected behavior**:
+- `lm=` should start high (~10, random logits over 50k vocab) and decrease
+- If working: samples should show more coherent word sequences
+- V and ema metrics should be comparable to exp 17 (same drifting config)
+- Combined loss may need weight tuning if lm_loss dominates
+
+**Result** (stopped at step 600 — pattern clear):
+
+Early phase (steps 20-200): LM loss worked spectacularly at first:
+- lm dropped 11.31 → 0.09 (100x reduction in 200 steps)
+- ema dropped 14.0 → 0.93 (best minimum we've seen at this scale)
+- V stable at 5.1-5.3, vanc dropping 27→8.6
+
+Mid phase (steps 200-400): ema started climbing 0.93 → 1.58. LM loss stayed near 0
+(0.01-0.23). Samples at step 200 showed repetitive word patterns:
+- "bott Moj bott Moj bott" / "JS excerpt JS excerpt" / "Pesh Pesh Pesh"
+Diverse between samples but repetitive within each sample.
+
+Late phase (steps 400-600): Samples collapsed to single token per sample:
+- "doctr doctr doctr doctr..." (3 out of 4 samples identical)
+- ema climbed to 2.0, V grew to 6.7-9.0
+- LM loss stayed at 0.02-0.18 (near zero throughout)
+- div ratcheted above dref again (48.8 at step 540)
+
+**Post-mortem — LM loss rewards repetition**:
+
+The fundamental problem: minimizing cross-entropy rewards the MOST PREDICTABLE sequences,
+and the most predictable sequences are repetitive ones. GPT-2 assigns near-zero cross-entropy
+to "doctr doctr doctr..." because after seeing "doctr" 5 times, it predicts "doctr" with
+near certainty. The generator found this degenerate minimum instantly.
+
+This is a well-known failure mode:
+- Beam search in NMT produces repetitive outputs for the same reason
+- Repetition penalty / n-gram blocking is standard in generation for this reason
+- Low cross-entropy ≠ natural language; natural language has MODERATE entropy (words are
+  somewhat but not perfectly predictable from context)
+
+The LM loss is actively harmful: it pulls the generator toward repetitive sequences,
+conflicting with both the drifting loss (which wants gen features to match diverse real
+features) and the diversity regularizer.
+
+**Key insight**: The right LM signal is not "minimize cross-entropy" but rather
+"produce sequences with GPT-2 perplexity similar to real text." Real text has perplexity
+~20-50 on GPT-2, not 1.0 (repetition). Need a target-matching approach, not minimization.
+
+---
+
+### Experiment 19: Perplexity-matching LM loss + repetition penalty
+
+**Config**: debug_scaled.yaml (384-dim, 4 layers, batch=32, 2000 steps)
+**Changes**:
+
+Replace the cross-entropy minimization LM loss with two complementary signals:
+
+1. **Perplexity-matching loss**: Instead of minimizing CE, penalize deviation from
+   real text perplexity. Compute CE on real text (frozen, computed once), compute CE
+   on generated text, loss = (gen_CE - real_CE)^2. This targets the natural entropy
+   regime rather than the degenerate minimum at CE=0.
+
+2. **Repetition penalty**: Penalize repeated n-grams in generated token sequences.
+   For each position, compute similarity to previous k positions' nearest-vocab tokens.
+   If consecutive tokens map to the same vocab token, add penalty. This directly blocks
+   the failure mode from exp 18.
+
+**Result** (stopped at step 240 — pattern clear):
+
+Perplexity matching (TECHNICAL SUCCESS):
+- Real text CE reference: 2.78 (ppl=16.1)
+- gen_ce converged to ~2.76-3.29 range by step 100 — tracking the reference closely
+- lm_loss (squared deviation) dropped to ~0.00-0.27 — perplexity matching works perfectly
+- Compare exp 18: CE went to 0.01 (repetitive), here it stays at 2.78 (matching real text)
+
+Repetition penalty (FAILED):
+- rep_cos climbed 0.55 → 0.92 → 1.00 by step 200 — perfect consecutive repetition
+- rep_loss saturated at 0.99-1.00 (penalty too weak, max contribution = 0.5 per step)
+- The `enc_cos.clamp(min=0.5).mean()` formulation has a bounded maximum of 1.0,
+  providing constant gradient once similarity exceeds 0.5 — not enough to overcome
+  the combined pull of drifting loss + LM loss toward repetitive patterns
+
+Generated samples (step 200): Still repetitive word salad with moderate variety:
+- "366 depleted 366 lightly 366 366 lightly 366 dwindling 366"
+- "opVertDialVert eagleVert eagle op op opVert"
+- Better than exp 18's "doctr doctr doctr" — some variety within repetition patterns
+
+Drifting metrics: ema=1.04 at step 200 (better than exp 17's 0.69 but comparable).
+V stable at 5.1-5.2. div declining 43→19 (heading toward dref problem again).
+
+**Post-mortem — why auxiliary losses can't fix this**:
+
+The perplexity-matching loss achieved its goal (gen_ce ≈ real_ce) but the generator still
+produces garbage. This reveals a deeper issue: **matching aggregate statistics doesn't
+guarantee local coherence**. A sequence of random words can have the same average cross-
+entropy as natural text if the words are individually common — GPT-2 assigns moderate
+probability to many words regardless of context.
+
+The repetition penalty was too weak to overcome the strong gradient from drifting + LM
+losses. But even a stronger penalty would just prevent one specific failure mode while
+leaving the generator free to find other degenerate minima.
+
+**Key insight**: The problem is that ALL loss signals operate on continuous representations
+and are computed per-batch. The generator has enormous freedom to satisfy these constraints
+while producing garbage text. Adding more constraints (LM, repetition) adds more
+optimization objectives but doesn't reduce the solution space to "coherent text."
+
+The drifting field approach may need a fundamentally different architecture — perhaps
+operating at the token level (discrete diffusion) rather than in continuous embedding
+space, or fine-tuning GPT-2 instead of using it frozen.
+
+---
+
+### Summary of experiments 15-19: Preventing collapse vs generating text
+
+| Exp | Key Change | Collapse? | Text Quality | ema min | Note |
+|-----|-----------|-----------|-------------|---------|------|
+| 15 | Log-barrier div + spectral reg | No (div 17-40) | Gibberish/unicode | 2.1 | Diversity maintained, no coherence |
+| 16 | feat_norm real-only + frozen dref + V avg | No | Single-token repeat | 34 | feat_norm change broke stability |
+| 17 | Drop MoCo, revert feat_norm, keep fixes | No | Unicode garbage | 0.69 | Best ema, worst samples |
+| 18 | GPT-2 CE minimization loss | Yes (repetitive) | "doctr doctr doctr" | 0.93 | CE rewards repetition |
+| 19 | Perplexity-matching + rep penalty | Partially | Repetitive word salad | 1.04 | PPL match works, rep too weak |
+
+**Fundamental challenge**: Preventing collapse (maintaining diversity) and generating
+coherent text are orthogonal problems. Experiments 15-17 solved collapse but produced
+garbage; experiments 18-19 added token-level signals but these were gamed by the generator.
+The continuous embedding space has too many degenerate solutions that satisfy loss
+constraints without producing meaningful text.
