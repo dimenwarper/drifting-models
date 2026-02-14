@@ -448,3 +448,203 @@ regularizer 1/(avg_dist + 1e-4) is too weak to counteract this at production sca
 - Queue size logged as `qsz=` in diagnostics
 - Disabled use_random_neg (kept code, toggled off)
 - Production config: moco_queue_size=8192, moco_n_neg=128, moco_min_queue=256
+
+**Debug result**: Stable at small scale. div held 10-15 throughout 500 steps.
+
+**Production result**: div collapsed 88→5 over 2000 steps. Queue tracked along with collapse —
+by step 1000, queue entries were also from collapsed states. MoCo queue can't save you when
+the collapse is slow enough that the entire queue history has rotated through.
+
+**Root cause**: No external negatives (self-contrastive, random, MoCo queue) can push collapsed
+samples apart — when all generated samples are at the same point, they all receive identical
+repulsion vectors. The fix must prevent collapse *structurally*, not through negative strategy.
+
+---
+
+### Experiment 15: Log-barrier diversity + spectral regularization
+**Config**: debug.yaml with `diversity_weight: 0.5`, `spectral_weight: 0.01`
+**Changes**:
+- Replaced diversity regularizer: `1/(avg_dist + 1e-4)` → `-log(avg_dist / D_ref + eps)`
+  - D_ref = EMA-tracked reference diversity (momentum 0.99, init from first batch)
+  - At div=D_ref: loss = 0 (no penalty at reference level)
+  - At div=D_ref/2: loss = 0.69 (30-60x stronger than 1/x at healthy diversity)
+  - Gradient -1/x gives consistent pressure across entire diversity range
+  - Clamped at 0: no reward for exceeding reference (prevents runaway expansion)
+- Added spectral regularization on generator weights (src/drifting/spectral.py)
+  - Soft penalty: (sigma_max - 1.0)^2 on weight matrices with dim >= 2, shape[0] >= 4
+  - Power iteration (3 iters) for efficient sigma_max approximation
+  - Prevents rank collapse where all outputs lie in low-dim subspace
+- Lowered diversity_weight: 5.0→2.0 (production), 0.1→0.5 (debug) — log-barrier much stronger
+- Added debug_scaled.yaml: halfway config (384-dim, 4 layers, batch=32, 2000 steps)
+  to try replicating production collapse on Mac
+- Kept MoCo queue enabled — with collapse prevented, queue provides diverse history
+
+**Debug-scaled result** (384-dim, 4 layers, batch=32, 2000 steps, lr=5e-5):
+
+Diversity (PRIMARY GOAL — SUCCEEDED):
+- div NEVER collapsed: oscillated 17-40 throughout all 2000 steps
+- Actually *increased* in later steps (div=33.6 at step 2000 vs ~19 early)
+- dref tracked smoothly 18→32 — log-barrier providing consistent pressure
+- Compare to exp 14 production: div 88→5 (catastrophic collapse)
+
+Loss (CONCERNING — late-phase explosion):
+- ema started ~2.1 (step 200), oscillated 2-3 mid-run
+- Climbed sharply after step 1700: ema=4.65 at step 2000
+- V field magnitude grew throughout: V=5-7 early → V=12.0 at end
+- λ (attraction weight) climbed 0.50→0.75 — attraction dominating but not converging
+
+Generated samples:
+- All gibberish/unicode throughout — never produced English text
+- By step 2000: mostly empty strings or unicode garbage (ÃÂÃÂ, rawdownload, etc.)
+- Samples remain *diverse* (not collapsed to single token) but not meaningful
+
+Other metrics:
+- vanc: dropped 25→2.3 (vocab anchoring working well)
+- vocab_dist/mean: dropped 14.7→2.99 (embeddings close to vocab, still generating garbage)
+- spectral_reg: stable 12-15 throughout (not visibly helping)
+- smooth: stable at 0.011
+
+**Assessment**: Log-barrier diversity is working as designed — collapse is prevented. But the
+model isn't learning to generate text. The V field grows monotonically, meaning the generator
+moves further from real data over time despite the attraction term. The fundamental learning
+signal may need revisiting — the drifting loss successfully prevents collapse but doesn't
+guide the generator toward producing coherent text.
+
+**Next steps to investigate**:
+1. Loss growing = generator embeddings diverging from real distribution in feature space.
+   Is the smooth_proj mapping too lossy? Are we losing the signal that would guide toward
+   real text?
+2. V growing monotonically suggests attraction and repulsion are both increasing but not
+   balancing. May need to investigate the loss landscape geometry.
+3. vocab_dist/mean=2.99 means logits are near vocab embeddings, but the *wrong* vocab.
+   The nearest-neighbor decoding finds tokens, but they're not meaningful sequences.
+
+---
+
+### Experiment 16: Fix learning signal — FeatureNorm + diversity ratchet + V averaging
+
+**Config**: debug_scaled.yaml (384-dim, 4 layers, batch=32, 2000 steps)
+**Changes**: Three fixes targeting why V grows monotonically and loss explodes despite
+diversity being maintained in exp 15.
+
+**Fix 1: FeatureNormalizer scale from real data only** (PRIMARY)
+- Before: `feat_norm.update_scale(cat(phi_gen, phi_pos))` — as gen approaches real,
+  cross-distances shrink → scale shrinks → normalized features inflate → V stays large
+  regardless of actual convergence. The normalizer directly counteracts learning.
+- After: `feat_norm.update_scale(phi_pos)` — real features are stable (frozen GPT-2 +
+  fixed dataset), so scale stabilizes. As gen converges, normalized V can actually decrease.
+
+**Fix 2: Freeze diversity reference after init**
+- Before: `div_ema_ref = 0.99 * div_ema_ref + 0.01 * avg_dist` — tracked from 18→32 in
+  exp 15, a one-way ratchet. Log-barrier defended this elevated floor, pushing samples
+  apart and conflicting with drifting loss attraction.
+- After: `div_ema_ref` set once from first batch, then frozen. Barrier maintains initial
+  diversity level without escalating.
+
+**Fix 3: Average V across temperatures (not sum)**
+- Before: V summed across 3 temperatures [0.02, 0.05, 0.2] → V is 3x single-temperature
+  magnitude → pushes Huber loss into linear regime (V >> delta=1.0) in most dimensions →
+  constant-magnitude gradients, can't distinguish near-equilibrium from far.
+- After: V averaged → V magnitude ~1/3 → more dimensions in Huber quadratic regime near
+  equilibrium, giving stronger relative gradient signal when close to converging.
+
+**Result**: All three fixes together made things WORSE:
+- V grew from 21→55 (vs exp 15's 5→12) — nearly 5x larger
+- ema loss climbed to 34 (vs exp 15's 4.65 at worst)
+- Samples degraded to single-token repetition
+- dref frozen at 41.3 (fix 2 worked as designed)
+- div held 20-34 (log-barrier + frozen ref prevented collapse)
+
+**Post-mortem — what went wrong**:
+
+Fix 1 (feat_norm real-only) BACKFIRED: The original combined normalizer (gen+real) acts
+as natural damping — when gen is far from real, the scale is large, V is small, training
+is gentle. Removing gen from the scale removed this damping, exposing raw V magnitude
+(21→55 instead of 5→12). The combined normalizer is a useful stability feature, not a bug.
+
+Fix 2 (frozen div ref) WORKED: dref constant at 41.3 throughout. Diversity held 20-34,
+no ratchet. Keep this.
+
+Fix 3 (V averaging) MASKED BY FIX 1: V averaging should reduce V by 3x, but the
+feat_norm change inflated V by ~4x, net result was worse. With feat_norm reverted,
+V averaging should show its benefit.
+
+---
+
+### Experiment 17: Drop MoCo queue, revert feat_norm, keep good fixes
+
+**Config**: debug_scaled.yaml (384-dim, 4 layers, batch=32, 2000 steps)
+**Changes**:
+
+1. **Revert FeatureNormalizer to combined gen+real scale** — the combined scale provides
+   natural damping (when gen far from real → large scale → small V → gentle training).
+   Exp 16 showed removing this caused V to grow 5x.
+
+2. **Disable MoCo queue → revert to self-contrastive** — queue negatives are structurally
+   closer to gen features than real features (they ARE past gen features), causing:
+   - Attraction: gen→real distances large → softmax diffuse → weak pull (a=1-5)
+   - Repulsion: gen→queue distances small → softmax concentrated → strong push (r=20-55)
+   - Result: repulsion 10-20x attraction, generator pushed away from everything.
+   Self-contrastive works now because log-barrier + frozen div ref prevent collapse.
+
+3. **Keep V averaging** (from exp 16) — with feat_norm reverted, V should be ~3x lower
+   than exp 15's 5→12 range.
+
+4. **Keep frozen div ref** (from exp 16) — confirmed working, prevents ratchet.
+
+**Expected behavior**:
+- V should be ~1.5-4 (exp 15 was 5-12, averaging /3, combined normalizer damps further)
+- a and r should be comparable magnitude (not 10-20x apart)
+- div should stay >10 (log-barrier + frozen ref)
+- dref constant after first log
+- ema loss should plateau or decrease, NOT climb monotonically
+- No rneg or qsz in logs (MoCo disabled)
+
+**Result** (stopped at step 1220 — pattern clear):
+
+Early phase (steps 20-160): Promising. V dropped 25→3.9, ema 14.3→0.69. Best ema minimum
+we've seen at this scale. a/r ratio ~3:1 (better than MoCo's 10-20x).
+
+Mid phase (steps 200-500): V grew slowly 5.0→8.2, ema climbed 0.74→1.6. Diversity dropped
+from 42 to 12-15, then RATCHETED BACK UP past dref=41.8 (div=26→40 by step 560).
+Once div > dref, the log-barrier provides zero pressure (clamped at 0).
+
+Late phase (steps 600-1220): V oscillated 6.2-8.7, ema hovering 1.6-2.0. Diversity
+oscillated 32-56 (consistently above dref). Samples degraded catastrophically:
+- Step 200: diverse gibberish ("SAMsung sparse", "indignation repetition")
+- Step 600: repetitive ("CaliforniaCalifornia", "SomeoneSomeone")
+- Step 800: unicode garbage ("�����", empty strings)
+- Step 1200: still garbage, vocab_dist/mean dropped 24→6.5
+
+Key metrics at end: V=6.3, ema=1.59, div=36-50, dref=41.8, vanc=3.5, a/r~3:1.
+No MoCo metrics (disabled as expected).
+
+**Post-mortem — what went wrong**:
+
+1. **Frozen dref didn't prevent the ratchet** — it prevents the *reference* from ratcheting,
+   but the *actual* diversity ratcheted above it. When div > dref, barrier loss = 0 (clamped),
+   so the barrier provides no constraint. The diversity expanded freely, driven by
+   self-contrastive repulsion with no opposing force.
+
+2. **Self-contrastive repulsion still imbalanced** — a/r ratio was 3:1 throughout, same as
+   exp 10/15. The removal of MoCo didn't improve the balance because self-contrastive has the
+   same structural problem: gen→gen distances (denominator of repulsion softmax) are always
+   smaller than gen→real distances (denominator of attraction softmax). The concentration
+   difference creates the imbalance.
+
+3. **Feature-space diversity ≠ text quality** — div=50 means samples are far apart in
+   projected feature space, but they decoded to unicode garbage. The drifting loss optimizes
+   in feature space, and the generator found a "solution" where embeddings are near vocab
+   (vanc=3.5) but map to garbage tokens (ÃÂÃÂ, raw bytes, etc.) that happen to be diverse
+   in feature space.
+
+4. **V averaging helped initially but wasn't enough** — V was 3.9-5.0 in early phase (as
+   predicted), but still grew to 6-8 later. The combined normalizer's damping effect weakened
+   as gen features moved closer to real (scale shrinks → V inflates).
+
+**Key insight**: The fundamental problem is not the negative strategy (MoCo vs self-contrastive
+vs random). ALL contrastive approaches push gen away from negatives, but none provide a
+gradient toward producing *coherent text*. The attraction term pulls gen toward real features,
+but the feature space has many degenerate minima where garbage tokens have similar projected
+features to real text. Without a direct token-level signal (like cross-entropy on actual
+token predictions), the generator will always find these shortcuts.

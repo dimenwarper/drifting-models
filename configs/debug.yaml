@@ -43,7 +43,8 @@ training:
   n_pos: 16
   queue_size: 512
   max_steps: 500
-  diversity_weight: 0.1
+  diversity_weight: 0.5          # log-barrier is much stronger, needs lower weight than 1/x
+  spectral_weight: 0.01          # soft spectral norm penalty on generator weights
   vocab_anchor_weight: 1.0      # keep generator output near valid tokens
   use_random_neg: false           # disabled — replaced by MoCo queue
   n_random_neg: 16               # number of random negative sequences per step

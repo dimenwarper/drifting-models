@@ -107,6 +107,12 @@ def compute_V(
         V_attract = V_attract + result["V_attract"]
         V_repel = V_repel + result["V_repel"]
 
+    # Average across temperatures (not sum) to keep V magnitude in Huber quadratic regime
+    n_temps = len(temperatures)
+    V = V / n_temps
+    V_attract = V_attract / n_temps
+    V_repel = V_repel / n_temps
+
     return {"V": V, "V_attract": V_attract, "V_repel": V_repel}
 
 

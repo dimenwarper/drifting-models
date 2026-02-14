@@ -18,6 +18,7 @@ from src.features.pooling import TextFeaturePooler, pool_features
 from src.drifting.loss import DriftingLoss
 from src.drifting.field import pairwise_l2
 from src.drifting.smooth_proj import SmoothProjectionBank
+from src.drifting.spectral import spectral_regularization
 from src.data.dataset import TinyStoriesDataset
 from src.data.queue import SampleQueue
 from src.drifting.queue import FeatureQueue
@@ -243,6 +244,7 @@ def train(config_path: str = "configs/default.yaml"):
     B = tc["batch_size"]
     ema_loss = None  # EMA-smoothed loss for tracking real trend
     ema_V_raw = None
+    div_ema_ref = None  # EMA reference diversity for log-barrier
     S = cfg["data"]["seq_len"]
     C = cfg["generator"]["hidden_dim"]
 
@@ -377,17 +379,32 @@ def train(config_path: str = "configs/default.yaml"):
                     loss = loss + smooth_weight * s_loss
                     metrics["smooth_loss"] = s_loss.item()
 
-            # Diversity regularizer
+            # Diversity regularizer (log-barrier)
             diversity_weight = tc.get("diversity_weight", 0.0)
             if diversity_weight > 0:
                 gen_flat = suffix_out.mean(dim=1)
                 pw_dist = pairwise_l2(gen_flat, gen_flat)
                 eye_mask = ~torch.eye(B, device=device, dtype=torch.bool)
                 avg_dist = pw_dist[eye_mask].mean()
-                diversity_loss = 1.0 / (avg_dist + 1e-4)
+
+                # Freeze reference diversity after init — no ratchet
+                if div_ema_ref is None:
+                    div_ema_ref = avg_dist.item()
+
+                # Log-barrier: strong gradient at all diversity levels
+                diversity_loss = -torch.log(avg_dist / div_ema_ref + 1e-6)
+                diversity_loss = diversity_loss.clamp(min=0.0)  # No reward for exceeding reference
                 loss = loss + diversity_weight * diversity_loss
                 metrics["gen_diversity"] = avg_dist.item()
                 metrics["diversity_loss"] = diversity_loss.item()
+                metrics["div_ref"] = div_ema_ref
+
+            # Spectral regularization on generator weights
+            spectral_weight = tc.get("spectral_weight", 0.0)
+            if spectral_weight > 0:
+                s_reg = spectral_regularization(generator)
+                loss = loss + spectral_weight * s_reg
+                metrics["spectral_reg"] = s_reg.item()
 
             # Vocab anchoring — keep generator output near valid token embeddings
             vocab_weight = tc.get("vocab_anchor_weight", 0.0)
@@ -486,6 +503,10 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"smooth={metrics['smooth_loss']:.3f}")
             if "vocab_anchor" in metrics:
                 diag_parts.append(f"vanc={metrics['vocab_anchor']:.1f}")
+            if "div_ref" in metrics:
+                diag_parts.append(f"dref={metrics['div_ref']:.1f}")
+            if "spectral_reg" in metrics:
+                diag_parts.append(f"spec={metrics['spectral_reg']:.3f}")
             if "rand_neg" in metrics:
                 diag_parts.append(f"rneg={metrics['rand_neg']:.1f}")
             if moco_queue is not None:

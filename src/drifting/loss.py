@@ -69,7 +69,9 @@ class DriftingLoss:
             feat_norm, drift_norm = self._get_normalizers(name)
 
             # Update and apply feature normalization
-            # Use all features together for scale estimation
+            # Combined scale acts as natural damping — when gen is far from real,
+            # scale is large, V is small, training is gentle. As gen converges,
+            # scale shrinks, V magnitude is preserved for fine-grained learning.
             with torch.no_grad():
                 all_feats = torch.cat([phi_gen.detach(), phi_pos.detach()], dim=0)
                 feat_norm.update_scale(all_feats)

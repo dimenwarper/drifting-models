@@ -76,7 +76,7 @@ def test_zero_at_equilibrium_exact(seed):
 
 
 def test_multi_temperature(seed):
-    """Multi-temperature V should be sum of individual temperature Vs."""
+    """Multi-temperature V should be average of individual temperature Vs."""
     N, C = 32, 16
     phi_x = torch.randn(N, C)
     phi_pos = torch.randn(N, C)
@@ -88,8 +88,9 @@ def test_multi_temperature(seed):
     V_sum = torch.zeros_like(phi_x)
     for tau in temps:
         V_sum += compute_V_single_temp(phi_x, phi_pos, phi_neg, tau)["V"]
+    V_avg = V_sum / len(temps)
 
-    assert torch.allclose(V_multi, V_sum, atol=1e-5)
+    assert torch.allclose(V_multi, V_avg, atol=1e-5)
 
 
 def test_gradient_flow(seed):
