@@ -45,8 +45,12 @@ training:
   max_steps: 500
   diversity_weight: 0.1
   vocab_anchor_weight: 1.0      # keep generator output near valid tokens
-  use_random_neg: true           # SDDLM-style: random vocab tokens as negatives
+  use_random_neg: false           # disabled — replaced by MoCo queue
   n_random_neg: 16               # number of random negative sequences per step
+  use_moco_queue: true
+  moco_queue_size: 1024           # ~64 steps of history at batch=16
+  moco_n_neg: 32                  # negatives sampled per step
+  moco_min_queue: 64              # min entries before using queue (4 steps warmup)
   gradient_accumulation: 1
 
   optimizer:

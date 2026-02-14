@@ -20,6 +20,7 @@ from src.drifting.field import pairwise_l2
 from src.drifting.smooth_proj import SmoothProjectionBank
 from src.data.dataset import TinyStoriesDataset
 from src.data.queue import SampleQueue
+from src.drifting.queue import FeatureQueue
 from src.inference.decode import decode_to_text, compute_vocab_distances
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -190,6 +191,14 @@ def train(config_path: str = "configs/default.yaml"):
         max_size=cfg["training"]["queue_size"],
     )
 
+    # MoCo feature queue for generated negatives
+    moco_queue = None
+    if cfg["training"].get("use_moco_queue", False):
+        moco_queue = FeatureQueue(max_size=cfg["training"].get("moco_queue_size", 8192))
+        logger.info(f"MoCo queue enabled: size={cfg['training'].get('moco_queue_size', 8192)}, "
+                     f"n_neg={cfg['training'].get('moco_n_neg', 128)}, "
+                     f"min={cfg['training'].get('moco_min_queue', 256)}")
+
     # Optimizer
     opt_cfg = cfg["training"]["optimizer"]
     opt_params = list(generator.parameters())
@@ -311,11 +320,18 @@ def train(config_path: str = "configs/default.yaml"):
                 real_pooled = smooth_proj(real_pooled)
                 gen_pooled = smooth_proj(gen_pooled)
 
-            # SDDLM-style random negative repulsion:
-            # Sample random vocab token sequences as negatives instead of self-contrastive.
-            # Random negatives provide collapse-independent repulsion.
+            # MoCo queue: push current gen features, sample past as negatives
+            if moco_queue is not None:
+                moco_queue.push(gen_pooled)
+
+            # Negatives selection: MoCo queue > random neg > self-contrastive
             neg_pooled = None  # None = self-contrastive (default)
-            if tc.get("use_random_neg", False):
+            if moco_queue is not None:
+                moco_min = tc.get("moco_min_queue", 256)
+                if moco_queue.size >= moco_min:
+                    moco_n = tc.get("moco_n_neg", 128)
+                    neg_pooled = moco_queue.sample(moco_n, device)
+            elif tc.get("use_random_neg", False):
                 n_rand = tc.get("n_random_neg", B)
                 rand_ids = torch.randint(
                     0, vocab_embeddings.shape[0], (n_rand, suffix_len), device=device
@@ -472,6 +488,8 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"vanc={metrics['vocab_anchor']:.1f}")
             if "rand_neg" in metrics:
                 diag_parts.append(f"rneg={metrics['rand_neg']:.1f}")
+            if moco_queue is not None:
+                diag_parts.append(f"qsz={moco_queue.size}")
 
             logger.info(f"Step {step} | {' | '.join(diag_parts)}")
 

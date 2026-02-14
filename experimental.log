@@ -421,3 +421,30 @@ single-token repetition. vocab_dist dropping 20→16 (on-manifold). rneg ~165 (g
 random tokens = not producing garbage).
 
 **Verdict**: Random negatives solve the collapse problem. Ready for production test.
+
+---
+
+### Experiment 13 production: Random negatives collapse at scale
+**Config**: default.yaml (768-dim, 12 layers, batch=64, use_random_neg=true, n_random_neg=64)
+**Result**: div collapsed 36.7→3.6, generated samples repeated single tokens.
+
+**Root cause**: Random negatives push gen away from random tokens but don't push generated
+samples apart from **each other**. Two identical outputs get the same repulsive gradient
+(same direction away from random tokens) → no inter-sample diversity pressure. The diversity
+regularizer 1/(avg_dist + 1e-4) is too weak to counteract this at production scale.
+
+---
+
+### Experiment 14: MoCo queue-based negatives
+**Config**: debug.yaml with `use_moco_queue: true`, `moco_queue_size: 1024`, `moco_n_neg: 32`
+**Changes**:
+- Added `FeatureQueue` (src/drifting/queue.py): multi-scale FIFO queue storing past generated
+  features (post smooth_proj) as negatives
+- Each step: push current gen_pooled to queue, sample from queue as neg_features
+- Past features are from diverse model states → provides inter-sample repulsion even during
+  collapse. As long as the queue is large enough (~64+ steps of history), it stays mostly
+  diverse through the critical collapse window.
+- Falls back to self-contrastive if queue not yet filled (moco_min_queue warmup)
+- Queue size logged as `qsz=` in diagnostics
+- Disabled use_random_neg (kept code, toggled off)
+- Production config: moco_queue_size=8192, moco_n_neg=128, moco_min_queue=256

@@ -68,8 +68,12 @@ training:
 
   diversity_weight: 5.0     # anti-collapse regularizer — needs to be strong at 768-dim scale
   vocab_anchor_weight: 1.0  # keep generator output near valid tokens (exp 11)
-  use_random_neg: true       # SDDLM-style: random vocab tokens as negatives (exp 13)
+  use_random_neg: false       # disabled — replaced by MoCo queue (exp 14)
   n_random_neg: 64           # match batch_size
+  use_moco_queue: true
+  moco_queue_size: 8192      # ~128 steps of history at batch=64
+  moco_n_neg: 128            # negatives sampled per step
+  moco_min_queue: 256        # min entries before using queue
   gradient_clip: 0.5        # tight clip needed — grad norms can spike (exp 2)
   ema_decay: 0.999
   precision: "bf16"          # bf16 for GPT-2 forward, fp32 for loss
