@@ -248,8 +248,10 @@ def train(config_path: str = "configs/default.yaml"):
     S = cfg["data"]["seq_len"]
     C = cfg["generator"]["hidden_dim"]
 
-    # Pre-move vocab embeddings to device for vocab anchoring / LM loss
-    need_vocab = tc.get("vocab_anchor_weight", 0.0) > 0 or tc.get("lm_weight", 0.0) > 0
+    # Pre-move vocab embeddings to device for vocab anchoring / LM loss / Gumbel snap
+    need_vocab = (tc.get("vocab_anchor_weight", 0.0) > 0
+                  or tc.get("lm_weight", 0.0) > 0
+                  or tc.get("gumbel_tau", 0.0) > 0)
     vocab_embs_device = vocab_embeddings.to(device) if need_vocab else None
     real_ce_ref = None  # Reference CE from real text (for perplexity-matching LM loss)
 
@@ -294,35 +296,30 @@ def train(config_path: str = "configs/default.yaml"):
             # Project to encoder dim if needed
             enc_input = embed_proj(suffix_out) if embed_proj is not None else suffix_out
 
-            # Gumbel-Softmax snap: force generator to commit to actual vocab tokens
-            gumbel_tau_cfg = tc.get("gumbel_tau", 0.0)
-            cur_gumbel_tau = None
-            if gumbel_tau_cfg > 0:
-                # Anneal temperature: start soft, go hard
-                tau_min = tc.get("gumbel_tau_min", 0.1)
-                tau_progress = step / tc["max_steps"]
-                cur_gumbel_tau = gumbel_tau_cfg + (tau_min - gumbel_tau_cfg) * tau_progress
-                # Compute similarities to vocab embeddings
+            # Top-k Gumbel-Softmax snap: force generator to commit to actual vocab tokens
+            # Uses only k nearest tokens per position (not full 50k) for healthy gradients
+            gumbel_tau = tc.get("gumbel_tau", 0.0)
+            if gumbel_tau > 0:
+                gumbel_k = tc.get("gumbel_topk", 64)
                 flat = enc_input.reshape(-1, enc_input.shape[-1])  # (B*S, D)
-                sims = flat @ vocab_embs_device.T / cur_gumbel_tau  # (B*S, V)
-                # Gumbel-Softmax: differentiable discrete selection
-                soft_tokens = nn.functional.gumbel_softmax(sims, tau=1.0, hard=False)
-                enc_input = (soft_tokens @ vocab_embs_device).reshape(B, -1, enc_input.shape[-1])
+                # Find top-k nearest vocab tokens by dot product similarity
+                sims = flat @ vocab_embs_device.T  # (B*S, V)
+                topk_sims, topk_ids = sims.topk(gumbel_k, dim=-1)  # (B*S, k)
+                # Gumbel-Softmax over k tokens — flat enough for real gradients
+                weights = nn.functional.gumbel_softmax(topk_sims, tau=gumbel_tau, hard=False)  # (B*S, k)
+                # Weighted sum of top-k token embeddings
+                topk_embs = vocab_embs_device[topk_ids]  # (B*S, k, D)
+                enc_input = (weights.unsqueeze(-1) * topk_embs).sum(dim=1)  # (B*S, D)
+                enc_input = enc_input.reshape(B, -1, topk_embs.shape[-1])
 
-            # Extract features
+            # --- Real features (computed once, reused across refinement steps) ---
             suffix_ids = input_ids[:, prefix_len:]
             suffix_mask = attention_mask[:, prefix_len:]
             with torch.no_grad():
                 with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
                     real_features = encoder(input_ids=suffix_ids, attention_mask=suffix_mask)
-            with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
-                gen_features = encoder(inputs_embeds=enc_input, attention_mask=None)
-
-            # Pool features
             real_pooled = pool_features(real_features, pooler, suffix_mask)
-            gen_pooled = pool_features(gen_features, pooler, None)
 
-            # Noise augmentation + smooth projection
             feat_noise_std = 0.0
             if smooth_proj is not None:
                 feat_noise_std = smooth_cfg.get("feature_noise_std", 0.1)
@@ -331,17 +328,7 @@ def train(config_path: str = "configs/default.yaml"):
                         (name, feat.detach() + torch.randn_like(feat) * feat_noise_std)
                         for name, feat in real_pooled
                     ]
-                    gen_pooled = [
-                        (name, feat + torch.randn_like(feat) * feat_noise_std)
-                        for name, feat in gen_pooled
-                    ]
-                # Project to smooth space (before drifting loss)
                 real_pooled = smooth_proj(real_pooled)
-                gen_pooled = smooth_proj(gen_pooled)
-
-            # MoCo queue: push current gen features, sample past as negatives
-            if moco_queue is not None:
-                moco_queue.push(gen_pooled)
 
             # Negatives selection: MoCo queue > random neg > self-contrastive
             neg_pooled = None  # None = self-contrastive (default)
@@ -368,12 +355,67 @@ def train(config_path: str = "configs/default.yaml"):
                     with torch.no_grad():
                         neg_pooled = smooth_proj(neg_pooled)
 
-            # Compute drifting loss (in fp32)
-            loss, metrics = drifting_loss.compute(
-                gen_features=gen_pooled,
-                pos_features=real_pooled,
-                neg_features=neg_pooled,
+            # --- Iterative refinement loop ---
+            n_refine = tc.get("n_refine_steps", 1)  # 1 = no refinement (backward compat)
+            refine_lr = tc.get("refine_lr", 0.1)
+            refine_lr_decay = tc.get("refine_lr_decay", 0.5)
+
+            # Ensure enc_input requires grad for autograd.grad in refinement
+            enc_input = enc_input.requires_grad_(True)
+
+            metrics = {}  # will be populated by refinement loop + final drift_metrics
+
+            # When n_refine > 1, create_graph=True requires double-backward through
+            # attention. Flash/efficient attention doesn't support this, so force the
+            # math backend which does. For n_refine=1 this is a no-op context.
+            _sdpa_ctx = (
+                torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH)
+                if n_refine > 1 else torch.nn.attention.sdpa_kernel(
+                    [torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                     torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+                     torch.nn.attention.SDPBackend.MATH])
             )
+            with _sdpa_ctx:
+              for refine_k in range(n_refine):
+                with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
+                    gen_features = encoder(inputs_embeds=enc_input, attention_mask=None)
+                gen_pooled = pool_features(gen_features, pooler, None)
+
+                if smooth_proj is not None:
+                    if feat_noise_std > 0:
+                        gen_pooled = [
+                            (name, feat + torch.randn_like(feat) * feat_noise_std)
+                            for name, feat in gen_pooled
+                        ]
+                    gen_pooled = smooth_proj(gen_pooled)
+
+                # MoCo queue: push gen features from final refinement step only
+                if moco_queue is not None and refine_k == n_refine - 1:
+                    moco_queue.push(gen_pooled)
+
+                # Compute drifting loss (in fp32)
+                drift_loss, drift_metrics = drifting_loss.compute(
+                    gen_features=gen_pooled,
+                    pos_features=real_pooled,
+                    neg_features=neg_pooled,
+                )
+                metrics[f"refine_{refine_k}_loss"] = drift_loss.item()
+
+                if refine_k < n_refine - 1:
+                    # Gradient-based refinement step
+                    eta = refine_lr * (refine_lr_decay ** refine_k)
+                    grad = torch.autograd.grad(drift_loss, enc_input, create_graph=True)[0]
+                    grad_norm = grad.norm()
+                    if grad_norm > 1.0:
+                        grad = grad / grad_norm
+                    enc_input = enc_input - eta * grad
+                    metrics[f"refine_{refine_k}_grad"] = grad_norm.item()
+
+            # Use final step's loss and metrics
+            loss = drift_loss
+            metrics.update(drift_metrics)
+            if n_refine > 1:
+                metrics["n_refine"] = n_refine
 
             # Log mean distance to random negatives (for monitoring)
             if neg_pooled is not None:
@@ -423,8 +465,45 @@ def train(config_path: str = "configs/default.yaml"):
                 loss = loss + spectral_weight * s_reg
                 metrics["spectral_reg"] = s_reg.item()
 
-            if cur_gumbel_tau is not None:
-                metrics["gumbel_tau"] = cur_gumbel_tau
+            # Position diversity loss — penalize high pairwise cosine sim within each sequence
+            pos_div_weight = tc.get("position_diversity_weight", 0.0)
+            if pos_div_weight > 0:
+                enc_norm = nn.functional.normalize(enc_input, dim=-1)  # (B, S, D)
+                sim_mat = torch.bmm(enc_norm, enc_norm.transpose(1, 2))  # (B, S, S)
+                eye = torch.eye(sim_mat.shape[1], device=device).unsqueeze(0)
+                off_diag = sim_mat * (1 - eye)
+                n_off = sim_mat.shape[1] * (sim_mat.shape[1] - 1)
+                pos_div_loss = off_diag.sum(dim=(1, 2)).mean() / n_off
+                loss = loss + pos_div_weight * pos_div_loss
+                metrics["pos_div"] = pos_div_loss.item()
+
+            # Bigram diversity loss — penalize repeated bigrams within each sequence
+            bigram_div_weight = tc.get("bigram_diversity_weight", 0.0)
+            if bigram_div_weight > 0:
+                bigrams = torch.cat([enc_input[:, :-1], enc_input[:, 1:]], dim=-1)  # (B, S-1, 2D)
+                bg_norm = nn.functional.normalize(bigrams, dim=-1)
+                bg_sim = torch.bmm(bg_norm, bg_norm.transpose(1, 2))  # (B, S-1, S-1)
+                bg_eye = torch.eye(bg_sim.shape[1], device=device).unsqueeze(0)
+                bg_off = bg_sim * (1 - bg_eye)
+                bg_n_off = bg_sim.shape[1] * (bg_sim.shape[1] - 1)
+                bigram_div_loss = bg_off.sum(dim=(1, 2)).mean() / bg_n_off
+                loss = loss + bigram_div_weight * bigram_div_loss
+                metrics["bigram_div"] = bigram_div_loss.item()
+
+            # Unique token ratio — non-differentiable monitoring
+            if pos_div_weight > 0 or bigram_div_weight > 0:
+                with torch.no_grad():
+                    flat_enc = enc_input.detach().reshape(-1, enc_input.shape[-1])
+                    nearest = torch.cdist(flat_enc, vocab_embs_device if vocab_embs_device is not None else vocab_embeddings.to(device)).argmin(dim=-1)
+                    nearest = nearest.reshape(B, -1)
+                    uniq_ratios = []
+                    for b in range(B):
+                        n_uniq = nearest[b].unique().numel()
+                        uniq_ratios.append(n_uniq / nearest.shape[1])
+                    metrics["uniq_ratio"] = sum(uniq_ratios) / len(uniq_ratios)
+
+            if gumbel_tau > 0:
+                metrics["gumbel_tau"] = gumbel_tau
 
             # GPT-2 perplexity-matching loss — target natural entropy, not minimum
             lm_weight = tc.get("lm_weight", 0.0)
@@ -586,6 +665,12 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"lm={metrics['lm_loss']:.2f}")
             if "gen_ce" in metrics:
                 diag_parts.append(f"ce={metrics['gen_ce']:.2f}")
+            if "pos_div" in metrics:
+                diag_parts.append(f"pdiv={metrics['pos_div']:.3f}")
+            if "bigram_div" in metrics:
+                diag_parts.append(f"bdiv={metrics['bigram_div']:.3f}")
+            if "uniq_ratio" in metrics:
+                diag_parts.append(f"uniq={metrics['uniq_ratio']:.2f}")
             if "rep_loss" in metrics:
                 diag_parts.append(f"rep={metrics['rep_loss']:.2f}")
             if "rep_cos" in metrics:
@@ -596,6 +681,23 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"rneg={metrics['rand_neg']:.1f}")
             if moco_queue is not None:
                 diag_parts.append(f"qsz={moco_queue.size}")
+            if "n_refine" in metrics:
+                nref = int(metrics["n_refine"])
+                diag_parts.append(f"nref={nref}")
+                rloss_parts = []
+                for k in range(nref):
+                    key = f"refine_{k}_loss"
+                    if key in metrics:
+                        rloss_parts.append(f"{metrics[key]:.3f}")
+                if rloss_parts:
+                    diag_parts.append(f"rloss={'→'.join(rloss_parts)}")
+                rgrad_parts = []
+                for k in range(nref - 1):
+                    key = f"refine_{k}_grad"
+                    if key in metrics:
+                        rgrad_parts.append(f"{metrics[key]:.1f}")
+                if rgrad_parts:
+                    diag_parts.append(f"rgrad={','.join(rgrad_parts)}")
 
             logger.info(f"Step {step} | {' | '.join(diag_parts)}")
 

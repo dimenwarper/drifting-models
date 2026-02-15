@@ -68,10 +68,14 @@ training:
 
   diversity_weight: 2.0     # log-barrier is much stronger than 1/x, needs lower weight (was 5.0)
   spectral_weight: 0.01    # soft spectral norm penalty on generator weights
-  vocab_anchor_weight: 1.0  # keep generator output near valid tokens (exp 11)
+  vocab_anchor_weight: 0.0  # disabled — top-k Gumbel makes vanc ~0 by construction (exp 23)
+  position_diversity_weight: 5.0   # intra-sequence position diversity (exp 22-23)
+  bigram_diversity_weight: 2.0     # bigram diversity — catches alternating patterns (exp 22-23)
+  gumbel_tau: 0.3           # top-k Gumbel-Softmax temperature (exp 23)
+  gumbel_topk: 64           # number of nearest vocab tokens per position (exp 23)
   use_random_neg: false       # disabled — replaced by MoCo queue (exp 14)
   n_random_neg: 64           # match batch_size
-  use_moco_queue: true
+  use_moco_queue: false       # disabled — queue negatives cause repulsion imbalance (exp 17)
   moco_queue_size: 8192      # ~128 steps of history at batch=64
   moco_n_neg: 128            # negatives sampled per step
   moco_min_queue: 256        # min entries before using queue

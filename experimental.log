@@ -906,3 +906,215 @@ generation (Diffusion-LM, MDLM, SLD) uses ITERATIVE REFINEMENT:
 1. Add iterative refinement: multi-step denoising in embedding space (diffusion-style)
 2. Fine-tune GPT-2 with drifting loss at the token level (use GPT-2 as generator, not encoder)
 3. Abandon continuous generation, use drifting field for discrete token scoring
+
+---
+
+### Experiment 21: Iterative refinement via drifting field
+
+**Motivation**: Exps 15-20 showed single-pass generation can't produce coherent text — the
+generator satisfies feature-space constraints while mapping to garbage tokens. Successful
+continuous text generation (Diffusion-LM, MDLM) uses iterative refinement. We add K-step
+gradient descent in embedding space using the drifting field V as the score function.
+
+**Design**:
+```
+Generator(noise) → enc_input_0   (initial embeddings)
+
+for k = 0..K-1:
+    gen_features_k = GPT-2(enc_input_k)
+    gen_pooled_k = pool + smooth_proj(gen_features_k)
+    drift_loss_k = drifting_loss(gen_pooled_k, real_pooled)
+
+    if k < K-1:
+        grad_k = ∂drift_loss_k / ∂enc_input_k   (create_graph=True)
+        enc_input_{k+1} = enc_input_k - η_k * grad_k   (η decays per step)
+
+final loss = drift_loss_{K-1} + diversity + spectral + vocab_anchor(enc_input_{K-1})
+```
+
+Key properties:
+- Real features computed ONCE, reused across all K steps
+- `create_graph=True` keeps computation graph connected — generator gets gradients through
+  the full refinement chain
+- Refinement gradient clipped to unit norm per step to prevent instability
+- Step size decays: η_k = refine_lr × refine_lr_decay^k (coarse→fine)
+- Gumbel-Softmax disabled (incompatible — refinement operates on continuous embeddings)
+- LM loss and rep penalty disabled (were ineffective in exps 18-20)
+
+**Config** (debug_scaled.yaml):
+- n_refine_steps: 3, refine_lr: 0.1, refine_lr_decay: 0.5
+- gumbel_tau: 0.0, lm_weight: 0.0, rep_penalty_weight: 0.0
+
+**Expected behavior**:
+- refine_0_loss > refine_1_loss > refine_2_loss (loss decreases across refinement steps)
+- Refinement gradients non-zero (signal flowing through embedding space)
+- Final embeddings closer to real data than initial generator output
+- ~2x wall time per step (3 GPT-2 forwards vs 1 for gen side)
+
+**Compute**: 4 GPT-2 forwards/step (1 real + 3 gen), ~7 sec/step, ~4 hrs for 2000 steps.
+If OOM: reduce batch_size to 16 or set create_graph=False (loses higher-order gradients).
+
+**Result**: [pending]
+
+---
+
+### Experiment 22: Token-level anti-repetition constraints
+
+**Config**: debug_scaled.yaml (384-dim, 4 layers, batch=32, 2000 steps)
+**Changes**:
+
+Experiments 15-21 showed feature-space losses alone can't prevent token repetition. The
+generator produces embeddings that match GPT-2 features but map to garbage like "pulling
+pulling pulling" or "Cr Cr Cr Boy Girl Cr Cr". The existing repetition penalty (exp 19)
+only looks at consecutive pairs — too weak and easily gamed.
+
+Added three token-level constraints:
+
+1. **Position diversity loss** (`position_diversity_weight: 5.0`): Penalize high pairwise
+   cosine similarity between ALL position pairs within each sequence. Real text has low avg
+   pairwise cosine sim (most tokens differ). "pulling pulling pulling" has sim ≈ 1.0.
+   Computed as mean off-diagonal of (B, S, S) cosine similarity matrix.
+
+2. **Bigram diversity loss** (`bigram_diversity_weight: 2.0`): Concatenate consecutive
+   positions into bigram vectors (2D), penalize pairwise cosine similarity. Catches "A B A B"
+   alternating patterns that unigram diversity misses.
+
+3. **Unique token ratio** (monitoring only, non-differentiable): Fraction of unique nearest-
+   neighbor vocab tokens per sequence. Tells us if differentiable losses are working at the
+   token level.
+
+Also disabled iterative refinement (`n_refine_steps: 1`) to isolate the new losses.
+
+Starting weights intentionally high — current repetitive output has cosine sim ≈ 0.9, need
+strong pressure. If drifting loss stops decreasing, reduce (5.0→2.0, 2.0→1.0).
+
+**Expected behavior**:
+- `pdiv` should decrease over training (lower = more diverse positions)
+- `bdiv` should decrease (fewer repeated bigrams)
+- `uniq` should increase (more unique tokens per sequence)
+- Drifting loss should still decrease (not completely dominated by diversity)
+- Generated samples should show more variety than "pulling pulling pulling"
+
+**Result**: FAILED. Position/bigram diversity losses had zero effect on repetition.
+
+- pdiv: 0.918 → 0.989 → 0.970 (got WORSE, plateaued near 1.0)
+- bdiv: same trajectory as pdiv
+- uniq: 0.16 → 0.04 → 0.05 (fewer unique tokens over training)
+- ema: 14.3 → 0.77 → 1.70 (dropped then climbed, typical pattern)
+- vanc: 25.3 → 5.2 (on-manifold, working)
+- Samples at step 400: "Sang Sang Sang Sang", "nipples nipples nipples"
+
+**Post-mortem**: The drifting loss pushes all positions toward a single feature-space
+attractor. pdiv/bdiv try to push positions apart but their gradient is diffuse (uniform
+average over all 64×64 pairs) while the drifting loss gradient is focused (one direction).
+The drifting loss wins. Operating on continuous embeddings where cosine sim is already 0.99
+gives pdiv almost no gradient signal to work with.
+
+**Key insight**: pdiv/bdiv need to operate on snapped token embeddings (post-Gumbel) where
+repeated tokens have cosine sim = exactly 1.0, and the Gumbel gradient can redirect
+positions to different tokens in their top-k set.
+
+---
+
+### Experiment 23: Top-k Gumbel-Softmax + position diversity
+
+**Config**: debug_scaled.yaml (384-dim, 4 layers, batch=32, 2000 steps)
+**Changes**:
+
+Exp 20 showed full Gumbel-Softmax (over 50k vocab) kills gradients — the logit gap between
+nearest and rest is huge, softmax saturates to one-hot. Exp 22 showed pdiv on continuous
+embeddings is ineffective — drifting loss pushes everything to the same point.
+
+**Fix**: Top-k Gumbel-Softmax. Only consider the k=64 nearest vocab tokens per position.
+
+1. **Top-k Gumbel-Softmax** (`gumbel_tau: 1.0, gumbel_topk: 64`): For each position,
+   find 64 nearest vocab tokens by dot product. Gumbel-Softmax over those 64 logits —
+   distribution is much flatter than over 50k → real gradients flow. Fixed tau (no annealing)
+   for simplicity.
+
+2. **Position diversity on post-snap embeddings**: pdiv now operates on the Gumbel-snapped
+   embeddings, which are weighted sums of actual vocab tokens. When two positions snap to
+   the same token, cosine sim = 1.0, and the Gumbel gradient can push them to different
+   tokens in their respective top-k sets.
+
+3. **Vocab anchoring disabled** (`vocab_anchor_weight: 0.0`): Top-k snapping makes
+   embeddings near vocab tokens by construction.
+
+4. **Refinement disabled** (`n_refine_steps: 1`): Isolate Gumbel effect.
+
+Also fixed bug: `need_vocab` condition didn't include `gumbel_tau > 0`, so vocab embeddings
+weren't moved to device when only Gumbel was enabled.
+
+**Expected behavior**:
+- vanc ≈ 0 (embeddings ARE weighted sums of vocab tokens)
+- grad_norm > 0 throughout (unlike exp 20's gradient death)
+- pdiv should decrease (diversity pressure on actual token embeddings)
+- uniq should increase (different positions → different tokens)
+- Samples should show diverse real words
+
+**Result**: PARTIAL SUCCESS — gradients alive, diversity improved, but drifting loss can't learn.
+
+Tested two tau values: tau=1.0 (soft) and tau=0.3 (harder).
+
+**tau=1.0 run** (stopped at step 980):
+
+Gradients (SUCCESS — solved exp 20's gradient death):
+- grad_norm 35-110 throughout — never zero. Top-k over 64 tokens keeps softmax non-degenerate.
+- Compare exp 20 (full 50k Gumbel): grad=0 from step 140 onward.
+
+Position diversity (SUCCESS — pdiv actually decreasing):
+- pdiv: 0.698 → 0.395 → 0.331 (steady decrease, contrast exp 22's 0.918 → 0.989)
+- bdiv: same trajectory as pdiv
+- uniq: 0.43 → 0.30 → 0.25 (started high but declined slowly)
+
+Drifting loss (FAILED — never decreased):
+- ema: 9.9 → 8.8 → 10.7 → 11.3 (flat then climbed)
+- V: 15-20 throughout (vs 3-5 without Gumbel)
+- vocab_dist: 29 → 34 → 41 (embeddings drifting OFF manifold over time)
+
+Samples: Step 200: "27 Reb Blitz Atlantic 27 27 room". Step 400: "flag flag flag Zone flag".
+Step 600: "Canadian polar syn polar Canadian". Step 800: "carpet polar rank chord judgment
+direction tab rank". Later samples show more variety (~6-7 cycling words) but still repetitive.
+
+**Post-mortem tau=1.0**: Soft Gumbel produces diffuse weighted averages of 64 tokens — not
+close to any single token. GPT-2 sees these blurry embeddings and produces features that
+don't match real text (V=18 vs V=5 without Gumbel). The drifting loss can't learn because
+the input to GPT-2 is fundamentally different from what it was trained on. pdiv and drifting
+loss are fighting: diversity pushes toward varied token mixtures, drifting loss needs
+coherent single-token embeddings to produce real-like features.
+
+**tau=0.3 run** (stopped at step 600):
+
+Better across the board:
+- pdiv: 0.413 → 0.436 → 0.421 (stable ~0.43, not decreasing but started lower)
+- uniq: 0.53 → 0.42 → 0.43 (stable ~0.43, much better than tau=1.0's declining 0.25)
+- ema: 11.2 → 9.8 → 9.4 (actually decreasing! tau=1.0 was flat/climbing)
+- vocab_dist: 27.6 → 28.2 → 26.9 (stable, not drifting off like tau=1.0's 29→41)
+- a/r ratio: ~1.7:1 (healthier than tau=1.0's ~2:1)
+
+Samples: Step 200: "b BF Samp Vegas b Cad Cad b BFCE" (~7 words), "positive drivers Stew
+positive positive" (~4 words). Step 400: "pole Bride Kay reflection pride fluid Gas freak"
+(~8 words). Step 600: "manual precision mus wild monster Dirty Hot animal thread" (~9 words).
+
+**Post-mortem tau=0.3**: Harder snapping means GPT-2 sees more realistic single-token-like
+embeddings → drifting loss can learn (ema decreasing). But the model settles into a local
+optimum with 6-9 cycling words per sequence. Vocab_dist at 27 suggests embeddings are still
+far from real tokens (vs vanc=5 without Gumbel). The 384-dim/4-layer generator may be too
+small to solve the harder optimization imposed by top-k Gumbel.
+
+**Comparison across experiments**:
+
+| Metric (@ step 200) | Exp 22 (no Gumbel) | Exp 23 tau=1.0 | Exp 23 tau=0.3 |
+|----------------------|--------------------|--------------------|------------|
+| pdiv | 0.989 | 0.663 | 0.436 |
+| uniq | 0.04 | 0.31 | 0.42 |
+| ema | 0.77 | 8.8 | 9.8 |
+| vocab_dist | 23.2 | 29.4 | 27.6 |
+| grad alive? | yes | yes | yes |
+
+**Key insight**: Top-k Gumbel creates a tau tradeoff:
+- High tau (1.0): good diversity gradients, bad drifting loss (blurry embeddings)
+- Low tau (0.3): better drifting loss, diversity plateaus at ~0.43
+- The fundamental tension: Gumbel snapping adds noise/blur to embeddings that GPT-2 wasn't
+  trained on, inflating V and making the drifting loss 10x harder to optimize. The diversity
+  gains from architectural token commitment come at the cost of feature-space learning signal.
