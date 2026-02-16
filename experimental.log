@@ -1118,3 +1118,138 @@ small to solve the harder optimization imposed by top-k Gumbel.
 - The fundamental tension: Gumbel snapping adds noise/blur to embeddings that GPT-2 wasn't
   trained on, inflating V and making the drifting loss 10x harder to optimize. The diversity
   gains from architectural token commitment come at the cost of feature-space learning signal.
+
+---
+
+### Experiment 23 production run: Top-k Gumbel at scale (768-dim, 12 layers)
+
+**Config**: default.yaml (768-dim, 12 layers, batch=64, gumbel_tau=0.3, gumbel_topk=64,
+position_diversity_weight=5.0, bigram_diversity_weight=2.0, vocab_anchor_weight=0.0)
+
+**Run 1** (without sqrt(D) normalization): GRADIENT DEATH at step 5000.
+- At 768-dim, dot products are ~2x larger than 384-dim, making tau=0.3 effectively ~0.15
+- Gumbel softmax saturated to one-hot at lr peak → pdiv=1.000, grad=0.0, uniq=0.00
+- Fix: Added `/ math.sqrt(D)` to normalize Gumbel logits before softmax
+
+**Run 2** (with sqrt(D) normalization): Survived but plateaued.
+
+Early phase (steps 0-5000):
+- ema: dropped from ~10 to ~2.4 (genuine learning)
+- pdiv: settled around 0.22 (stable)
+- uniq: 0.08-0.17 (low but nonzero)
+- div: 88 → 594 → 1166 (exploding past dref=88, log-barrier provides zero constraint)
+- vocab_dist: 341 → 3832 (embeddings leaving token manifold)
+- Gradients alive throughout, survived lr peak at step 5000
+
+Plateau phase (steps 5000-32000):
+- ema: oscillated 2.1-2.9, no improvement over 27k steps
+- pdiv: steady 0.22-0.25 (no change)
+- uniq: stuck at 0.09-0.16, mostly 0.10-0.12 (actually worse than early phase)
+- div: equilibrium around 2000-2500 (not growing further, not shrinking)
+- vocab_dist at step 32000: mean=21,229 (!!), std=3,389, max=29,646
+  → 5.5x worse than step 10650's 3,832. Embeddings completely off-manifold.
+- V: 6.3-9.6, loss: 1.5-3.7 (volatile, not trending down)
+- grad: mostly 10-50, occasional spikes to 130-212
+
+Samples at step 10000 (~15 distinct cycling words):
+- "Malone massage blanket cannibal suit lighting team spec acle affer Score"
+- Some variety but still word salad with heavy repetition
+
+Samples at step 32000 (NO IMPROVEMENT from step 10000):
+- "affer lighting cannibal blanket team spec Score acle etting massage"
+- Same ~15 words cycling in different orders
+- Zero emergence of coherent text after 22k more steps
+
+**Post-mortem — why the run plateaued**:
+
+1. **Vocab distance catastrophe** (vocab_dist 341 → 21,229): The generator found that it can
+   minimize the drifting loss in feature space by using a region of embedding space far from
+   any real tokens. The Gumbel snap uses whatever's "nearest" but nearest is now 21k units
+   away — the snap is meaningless. This is the fundamental failure: nothing forces the
+   generator to stay near the token manifold.
+
+2. **No learning signal after plateau**: With embeddings 21k units from vocab, the Gumbel
+   snap produces near-random weighted averages of distant tokens. GPT-2 features on these
+   inputs are noise → V field is noise → no coherent gradient signal.
+
+3. **Diversity explosion uncontrolled**: div at 2000-2500 vs dref=88 means the log-barrier
+   is providing zero constraint. Samples spread out in embedding space but in a meaningless
+   way (all far from any real tokens).
+
+4. **pdiv/uniq stagnation**: Position diversity and unique token ratio flatlined because the
+   underlying embeddings are so far off-manifold that the Gumbel top-k is just selecting
+   among equally irrelevant tokens.
+
+**Key insight**: The Gumbel snap approach has a fatal flaw: it doesn't constrain WHERE in
+embedding space the generator operates. The generator can minimize drifting loss while moving
+arbitrarily far from the token manifold, making the snap irrelevant. We need an architectural
+constraint that keeps generator output ON the token manifold, not just a projection to
+nearest tokens after the fact.
+
+**Next experiment**: Unit sphere normalization — project both generator output and vocab
+embeddings to the unit sphere before computing Gumbel similarities. This prevents the
+generator from "escaping" the token manifold by moving to a distant region of embedding
+space, because all directions have unit norm and the only degree of freedom is angle.
+
+---
+
+### Experiment 24: Unit sphere embedding normalization
+
+**Motivation**: Exp 23 production run showed vocab_dist exploding from 341 to 21,229 — the
+generator found it can minimize drifting loss by moving embeddings far from ANY vocab token.
+The Gumbel snap becomes meaningless when the nearest token is 21k units away.
+
+**Root cause**: The generator output (enc_input) and vocab embeddings live in unbounded
+768-dim space. The generator has two degrees of freedom: direction (which token to approximate)
+and magnitude (how far from origin). Nothing constrains magnitude, so the generator uses it
+to exploit the feature space — moving to regions where GPT-2 features happen to satisfy the
+drifting loss but don't correspond to any real tokens.
+
+**Fix**: L2-normalize both generator output and vocab embeddings to the unit sphere before
+computing Gumbel similarities. This eliminates the magnitude degree of freedom:
+- All embeddings live on the unit hypersphere
+- Distance between any two points is bounded [0, 2]
+- The only degree of freedom is angular direction → which token(s) to approximate
+- vocab_dist is bounded by construction (max = 2.0 on unit sphere)
+- Gumbel-Softmax similarities are cosine similarities (dot product of unit vectors)
+- No need for sqrt(D) normalization — cosine similarities are already in [-1, 1]
+
+**Design**:
+```python
+# Before Gumbel snap:
+enc_input = F.normalize(enc_input, dim=-1)  # generator output → unit sphere
+vocab_norm = F.normalize(vocab_embs_device, dim=-1)  # vocab → unit sphere
+
+# Gumbel snap uses cosine similarity (not raw dot product):
+sims = flat @ vocab_norm.T  # cosine sim, range [-1, 1]
+# No sqrt(D) needed — already normalized
+topk_sims, topk_ids = sims.topk(gumbel_k, dim=-1)
+weights = F.gumbel_softmax(topk_sims / gumbel_tau_scale, tau=1.0, hard=False)
+# Snap to normalized vocab embeddings:
+topk_embs = vocab_norm[topk_ids]
+enc_input = (weights.unsqueeze(-1) * topk_embs).sum(dim=1)
+# Result: enc_input is ~unit norm (weighted sum of unit vectors)
+```
+
+**Key question**: Should we feed NORMALIZED embeddings to GPT-2, or re-scale after snap?
+- GPT-2 was trained on wte embeddings which have norm ~1-3 (not unit norm)
+- Feeding unit-norm embeddings may change GPT-2's internal dynamics
+- Option A: Feed normalized → simpler, GPT-2 may adapt (features still informative)
+- Option B: Normalize for snap only, rescale to original vocab norms for GPT-2 forward
+  → preserves GPT-2 behavior, slightly more complex
+- Start with Option A (simpler), switch to B if features degrade
+
+**Changes**:
+- train.py: Add L2 normalization before Gumbel snap, use cosine sim, remove sqrt(D)
+- No config changes needed (tau=0.3 should work with cosine sims in [-1,1])
+
+**Expected behavior**:
+- vocab_dist should stay bounded (max ~2.0 on unit sphere)
+- Gumbel snap should be meaningful (nearest token is always nearby in cosine space)
+- pdiv should be comparable or better (cosine sim on unit vectors is cleaner)
+- ema should decrease (drifting loss on real-ish embeddings)
+- uniq should improve (tokens are real, not distant garbage)
+- Samples should show real words that change over training
+
+**Risk**: GPT-2 may produce poor features on unit-norm inputs (different from training
+distribution). If so, try Option B (rescale after snap).

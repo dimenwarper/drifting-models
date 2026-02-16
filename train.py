@@ -302,13 +302,16 @@ def train(config_path: str = "configs/default.yaml"):
             if gumbel_tau > 0:
                 gumbel_k = tc.get("gumbel_topk", 64)
                 flat = enc_input.reshape(-1, enc_input.shape[-1])  # (B*S, D)
-                # Find top-k nearest vocab tokens by dot product similarity
-                D = flat.shape[-1]
-                sims = flat @ vocab_embs_device.T / math.sqrt(D)  # (B*S, V) — scaled by sqrt(dim) for consistent tau across dimensions
+                # L2-normalize to unit sphere — prevents generator from escaping token manifold
+                # by moving to distant regions of embedding space (exp 23: vocab_dist 341→21k)
+                flat = nn.functional.normalize(flat, dim=-1)
+                vocab_norm = nn.functional.normalize(vocab_embs_device, dim=-1)
+                # Cosine similarity (dot product of unit vectors), range [-1, 1]
+                sims = flat @ vocab_norm.T  # (B*S, V)
                 topk_sims, topk_ids = sims.topk(gumbel_k, dim=-1)  # (B*S, k)
                 # Gumbel-Softmax over k tokens — flat enough for real gradients
-                weights = nn.functional.gumbel_softmax(topk_sims, tau=gumbel_tau, hard=False)  # (B*S, k)
-                # Weighted sum of top-k token embeddings
+                weights = nn.functional.gumbel_softmax(topk_sims / gumbel_tau, tau=1.0, hard=False)  # (B*S, k)
+                # Weighted sum of top-k ORIGINAL (unnormalized) token embeddings for GPT-2
                 topk_embs = vocab_embs_device[topk_ids]  # (B*S, k, D)
                 enc_input = (weights.unsqueeze(-1) * topk_embs).sum(dim=1)  # (B*S, D)
                 enc_input = enc_input.reshape(B, -1, topk_embs.shape[-1])
