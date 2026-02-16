@@ -303,7 +303,8 @@ def train(config_path: str = "configs/default.yaml"):
                 gumbel_k = tc.get("gumbel_topk", 64)
                 flat = enc_input.reshape(-1, enc_input.shape[-1])  # (B*S, D)
                 # Find top-k nearest vocab tokens by dot product similarity
-                sims = flat @ vocab_embs_device.T  # (B*S, V)
+                D = flat.shape[-1]
+                sims = flat @ vocab_embs_device.T / math.sqrt(D)  # (B*S, V) — scaled by sqrt(dim) for consistent tau across dimensions
                 topk_sims, topk_ids = sims.topk(gumbel_k, dim=-1)  # (B*S, k)
                 # Gumbel-Softmax over k tokens — flat enough for real gradients
                 weights = nn.functional.gumbel_softmax(topk_sims, tau=gumbel_tau, hard=False)  # (B*S, k)
