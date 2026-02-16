@@ -1253,3 +1253,61 @@ enc_input = (weights.unsqueeze(-1) * topk_embs).sum(dim=1)
 
 **Risk**: GPT-2 may produce poor features on unit-norm inputs (different from training
 distribution). If so, try Option B (rescale after snap).
+
+**Result**: [superseded by exp 25 before production run completed — exp 24 was pushed but
+the production run from exp 23 was killed at step 32k due to plateau. Exp 24's unit sphere
+normalization is preserved as part of the cosine similarity computation in exp 25.]
+
+---
+
+### Experiment 25: Simplex snap with temperature annealing (inspired by Categorical Flow Maps)
+
+**Motivation**: Research into ScratchGAN (NeurIPS 2019) and Categorical Flow Maps (Roos et al.,
+2026) suggested two key insights:
+1. Working on the probability simplex (valid token distributions) prevents manifold escape
+   by construction — output is always a convex combination of vocab embeddings
+2. Gumbel noise hurts feature quality without providing necessary exploration (the drifting
+   field's repulsion provides exploration signal)
+
+**Changes from exp 23/24**:
+
+1. **Remove Gumbel noise**: Replace `gumbel_softmax(logits, tau)` with plain `softmax(logits/tau)`.
+   The Gumbel noise added stochasticity that degraded GPT-2 features. The drifting field's
+   repulsion term already provides exploration — we don't need sampling noise.
+
+2. **Temperature annealing**: Linear schedule from tau_start=1.0 → tau_end=0.1 over training.
+   - Early training (tau=1.0): soft distributions → blurry but smooth optimization landscape
+   - Late training (tau=0.1): sharp near-one-hot → realistic token embeddings for GPT-2
+   - Provides natural curriculum: coarse → fine-grained learning
+   - Inspired by CFM's interpolation on the simplex (soft→hard transition)
+
+3. **Keep cosine similarity** (from exp 24): L2-normalize generator output and vocab embeddings
+   before computing similarities. Eliminates magnitude as degree of freedom.
+
+4. **Keep top-k=64**: Prevents softmax saturation over full 50k vocab.
+
+5. **Snap to original (unnormalized) vocab embeddings**: Normalization is only for similarity
+   computation. GPT-2 receives embeddings in its native scale.
+
+**Config** (default.yaml):
+```yaml
+snap_tau_start: 1.0    # start soft
+snap_tau_end: 0.1      # anneal to hard
+snap_topk: 64          # top-k nearest tokens
+```
+
+Replaces: gumbel_tau=0.3, gumbel_topk=64
+
+**Expected behavior**:
+- stau= in logs shows annealing from 1.000 → 0.100 over training
+- Early: blurry features, high V, but smooth gradients — ema should decrease
+- Mid: tau ~0.5, features sharpen, ema should continue decreasing
+- Late: tau ~0.1, near-hard token commitment, realistic GPT-2 features
+- vocab_dist should stay bounded (convex combination of vocab → max norm ≈ 3)
+- No Gumbel noise → deterministic, reproducible, cleaner gradient signal
+- pdiv/uniq should improve as tau anneals (sharper → more distinct positions)
+
+**Key question**: Does the soft→hard curriculum give the drifting loss enough signal to learn
+in the early blurry phase? tau=1.0 was bad in exp 23 (V=18, ema flat). But that was FIXED tau=1.0
+for the whole run. With annealing, the model only spends the first ~10% of training at tau>0.5,
+then progressively sharpens. The early blurry phase is just warmup.

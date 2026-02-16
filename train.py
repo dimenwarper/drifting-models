@@ -248,9 +248,10 @@ def train(config_path: str = "configs/default.yaml"):
     S = cfg["data"]["seq_len"]
     C = cfg["generator"]["hidden_dim"]
 
-    # Pre-move vocab embeddings to device for vocab anchoring / LM loss / Gumbel snap
+    # Pre-move vocab embeddings to device for vocab anchoring / LM loss / simplex snap
     need_vocab = (tc.get("vocab_anchor_weight", 0.0) > 0
                   or tc.get("lm_weight", 0.0) > 0
+                  or tc.get("snap_tau_start", 0.0) > 0
                   or tc.get("gumbel_tau", 0.0) > 0)
     vocab_embs_device = vocab_embeddings.to(device) if need_vocab else None
     real_ce_ref = None  # Reference CE from real text (for perplexity-matching LM loss)
@@ -296,22 +297,25 @@ def train(config_path: str = "configs/default.yaml"):
             # Project to encoder dim if needed
             enc_input = embed_proj(suffix_out) if embed_proj is not None else suffix_out
 
-            # Top-k Gumbel-Softmax snap: force generator to commit to actual vocab tokens
-            # Uses only k nearest tokens per position (not full 50k) for healthy gradients
-            gumbel_tau = tc.get("gumbel_tau", 0.0)
-            if gumbel_tau > 0:
-                gumbel_k = tc.get("gumbel_topk", 64)
+            # Top-k softmax snap: force generator to commit to actual vocab tokens
+            # Simplex-constrained: output is always a convex combination of vocab embeddings
+            # No Gumbel noise — deterministic softmax, drifting field provides exploration (exp 25)
+            snap_tau_start = tc.get("snap_tau_start", 0.0)
+            snap_tau_end = tc.get("snap_tau_end", 0.0)
+            if snap_tau_start > 0:
+                # Linear temperature annealing: soft (tau_start) → hard (tau_end) over training
+                anneal_progress = min(step / max(tc["max_steps"], 1), 1.0)
+                snap_tau = snap_tau_start + (snap_tau_end - snap_tau_start) * anneal_progress
+                snap_k = tc.get("snap_topk", 64)
                 flat = enc_input.reshape(-1, enc_input.shape[-1])  # (B*S, D)
-                # L2-normalize to unit sphere — prevents generator from escaping token manifold
-                # by moving to distant regions of embedding space (exp 23: vocab_dist 341→21k)
-                flat = nn.functional.normalize(flat, dim=-1)
+                # Cosine similarity for token selection (L2-normalize both sides)
+                flat_norm = nn.functional.normalize(flat, dim=-1)
                 vocab_norm = nn.functional.normalize(vocab_embs_device, dim=-1)
-                # Cosine similarity (dot product of unit vectors), range [-1, 1]
-                sims = flat @ vocab_norm.T  # (B*S, V)
-                topk_sims, topk_ids = sims.topk(gumbel_k, dim=-1)  # (B*S, k)
-                # Gumbel-Softmax over k tokens — flat enough for real gradients
-                weights = nn.functional.gumbel_softmax(topk_sims / gumbel_tau, tau=1.0, hard=False)  # (B*S, k)
-                # Weighted sum of top-k ORIGINAL (unnormalized) token embeddings for GPT-2
+                sims = flat_norm @ vocab_norm.T  # (B*S, V), range [-1, 1]
+                topk_sims, topk_ids = sims.topk(snap_k, dim=-1)  # (B*S, k)
+                # Plain softmax — no Gumbel noise, simplex-constrained by construction
+                weights = nn.functional.softmax(topk_sims / snap_tau, dim=-1)  # (B*S, k)
+                # Weighted sum of ORIGINAL vocab embeddings (preserves GPT-2 input scale)
                 topk_embs = vocab_embs_device[topk_ids]  # (B*S, k, D)
                 enc_input = (weights.unsqueeze(-1) * topk_embs).sum(dim=1)  # (B*S, D)
                 enc_input = enc_input.reshape(B, -1, topk_embs.shape[-1])
@@ -506,8 +510,10 @@ def train(config_path: str = "configs/default.yaml"):
                         uniq_ratios.append(n_uniq / nearest.shape[1])
                     metrics["uniq_ratio"] = sum(uniq_ratios) / len(uniq_ratios)
 
-            if gumbel_tau > 0:
-                metrics["gumbel_tau"] = gumbel_tau
+            if snap_tau_start > 0:
+                metrics["snap_tau"] = snap_tau
+            elif tc.get("gumbel_tau", 0.0) > 0:
+                metrics["gumbel_tau"] = tc["gumbel_tau"]
 
             # GPT-2 perplexity-matching loss — target natural entropy, not minimum
             lm_weight = tc.get("lm_weight", 0.0)
@@ -679,6 +685,8 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"rep={metrics['rep_loss']:.2f}")
             if "rep_cos" in metrics:
                 diag_parts.append(f"rcos={metrics['rep_cos']:.2f}")
+            if "snap_tau" in metrics:
+                diag_parts.append(f"stau={metrics['snap_tau']:.3f}")
             if "gumbel_tau" in metrics:
                 diag_parts.append(f"gtau={metrics['gumbel_tau']:.2f}")
             if "rand_neg" in metrics:
