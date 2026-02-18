@@ -1311,3 +1311,96 @@ Replaces: gumbel_tau=0.3, gumbel_topk=64
 in the early blurry phase? tau=1.0 was bad in exp 23 (V=18, ema flat). But that was FIXED tau=1.0
 for the whole run. With annealing, the model only spends the first ~10% of training at tau>0.5,
 then progressively sharpens. The early blurry phase is just warmup.
+
+**Result**: FAILED — gradient death from step 0. Killed at step 360.
+
+- pdiv: 0.978 → 0.999 → 1.000 (all positions collapsed to identical embeddings)
+- uniq: 0.07 → 0.02 (fewer unique tokens over time)
+- grad: 0.0-0.2 throughout (generator effectively frozen)
+- ema: 11.9 → 7.4 → 9.5 (brief drop from warmup, then climbed)
+- V: 14-18 (huge, blurry embeddings — same as exp 23 tau=1.0)
+- vocab_dist: 27 (stable but meaningless)
+- Samples at step 200: "Berserker Berserker Berserker Berserker bolt Berserker..."
+
+**Post-mortem — plain softmax kills gradients**:
+
+The Gumbel noise was actually essential, not harmful. Without it, plain softmax at high tau
+produces nearly uniform weights over 64 tokens (each ≈ 1/64). The softmax gradient
+∂weights/∂logits is proportional to weights*(1-weights) — at 1/64 this is ~0.015, giving
+near-zero gradient back to the generator. The model is frozen from step 0.
+
+Gumbel noise breaks the symmetry: it creates peaked distributions even at high tau, giving
+one or two tokens most of the weight → much larger gradient signal. The stochasticity IS the
+gradient — without it, the softmax is too flat to differentiate between good and bad token
+choices.
+
+**Key insight**: For top-k softmax over cosine similarities in [-1, 1], the logit range is
+too narrow for plain softmax to create peaked distributions at any reasonable temperature.
+Gumbel noise effectively expands the logit range, creating the peaked distributions needed
+for gradient flow. Removing it was wrong.
+
+---
+
+### Experiment 24 (revised): Unit sphere Gumbel — cosine similarity + Gumbel noise
+
+**Motivation**: Exp 25 showed Gumbel noise is essential for gradient flow. Exp 23 showed
+vocab_dist explodes without magnitude constraints. The fix is to combine both:
+- L2-normalize for cosine similarity (prevents manifold escape)
+- Keep Gumbel-Softmax noise (preserves gradient flow)
+- Fixed tau=0.3 (worked well in exp 23 debug-scaled)
+
+This is exactly what exp 24 implemented but never ran — unit sphere normalization with
+Gumbel-Softmax preserved. Exp 25 incorrectly removed Gumbel; this reverts to Gumbel while
+keeping the cosine similarity fix.
+
+---
+
+### Experiment 26: Hard Gumbel + per-position drift
+
+**Context**: Experiments 20-25 struggled with two coupled problems:
+1. **Blurry embeddings**: Soft Gumbel-Softmax (hard=False) produces weighted averages of
+   vocab tokens. GPT-2 sees these blurry inputs and produces features that don't match real
+   text → V field is noise → no learning signal. Exp 23 production run: ema plateaued,
+   vocab_dist exploded to 21k.
+2. **Pooling destroys position info**: pool_features() aggregates features across positions
+   (subsample 32 random positions, global mean/std, windows of 4/16). The gradient back to
+   individual positions is diffuse — every position gets the same update direction → all
+   positions converge to same token → repetition. pdiv/bdiv auxiliary losses couldn't
+   overcome this (exp 22).
+
+**Changes** (two architectural fixes):
+
+1. **Hard Gumbel-Softmax** (hard=True): Forward uses argmax → actual token embeddings.
+   Backward uses soft gradient (straight-through estimator). GPT-2 sees real tokens → V field
+   is meaningful. Uses sqrt(D)-scaled dot products (exp 23 — good logit range).
+
+2. **Per-position drift** (per_position_drift: true): Compute V field on raw per-position
+   GPT-2 hidden states (B*n, D) instead of pooled multi-scale features. Each position gets
+   its own V → naturally prevents repetition without needing pdiv/bdiv auxiliary losses.
+   Uses a single configurable layer (drift_layer: 12) with position subsampling
+   (n_drift_positions: 32).
+
+3. **Disabled pdiv/bdiv** (position_diversity_weight: 0.0, bigram_diversity_weight: 0.0):
+   Per-position drift handles diversity structurally — auxiliary losses are redundant.
+   Code kept, just weights zeroed.
+
+**Config**:
+- gumbel_tau: 0.3, gumbel_topk: 64 (kept from exp 23)
+- per_position_drift: true, drift_layer: 12, n_drift_positions: 32
+- position_diversity_weight: 0.0, bigram_diversity_weight: 0.0
+
+**Memory considerations**:
+- Pairwise distance matrix: B*n_drift_pos × B*n_drift_pos
+  - debug_scaled: 32×32 = 1024 points → 1024×1024 matrix (manageable)
+  - production: 64×32 = 2048 points → 2048×2048 matrix (manageable)
+- Feature dim: 768→256 after smooth_proj (same as current)
+
+**Expected behavior**:
+- `grad` nonzero throughout (straight-through gradients from hard Gumbel)
+- `vocab_dist` stays low (hard snap = actual token embeddings)
+- `uniq` high and improving (per-position V pushes positions apart)
+- `ema` decreasing (meaningful V on real-token features)
+- Samples show diverse real words, not single-token repetition
+- If V too large (>20): features at 768-dim have larger norms, may need tuning
+
+**Result**: [pending]

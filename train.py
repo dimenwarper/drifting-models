@@ -248,10 +248,9 @@ def train(config_path: str = "configs/default.yaml"):
     S = cfg["data"]["seq_len"]
     C = cfg["generator"]["hidden_dim"]
 
-    # Pre-move vocab embeddings to device for vocab anchoring / LM loss / simplex snap
+    # Pre-move vocab embeddings to device for vocab anchoring / LM loss / Gumbel snap
     need_vocab = (tc.get("vocab_anchor_weight", 0.0) > 0
                   or tc.get("lm_weight", 0.0) > 0
-                  or tc.get("snap_tau_start", 0.0) > 0
                   or tc.get("gumbel_tau", 0.0) > 0)
     vocab_embs_device = vocab_embeddings.to(device) if need_vocab else None
     real_ce_ref = None  # Reference CE from real text (for perplexity-matching LM loss)
@@ -297,25 +296,19 @@ def train(config_path: str = "configs/default.yaml"):
             # Project to encoder dim if needed
             enc_input = embed_proj(suffix_out) if embed_proj is not None else suffix_out
 
-            # Top-k softmax snap: force generator to commit to actual vocab tokens
-            # Simplex-constrained: output is always a convex combination of vocab embeddings
-            # No Gumbel noise — deterministic softmax, drifting field provides exploration (exp 25)
-            snap_tau_start = tc.get("snap_tau_start", 0.0)
-            snap_tau_end = tc.get("snap_tau_end", 0.0)
-            if snap_tau_start > 0:
-                # Linear temperature annealing: soft (tau_start) → hard (tau_end) over training
-                anneal_progress = min(step / max(tc["max_steps"], 1), 1.0)
-                snap_tau = snap_tau_start + (snap_tau_end - snap_tau_start) * anneal_progress
-                snap_k = tc.get("snap_topk", 64)
+            # Top-k Gumbel-Softmax snap with hard=True (exp 26)
+            # sqrt(D)-scaled dot products (exp 23 — good logit range) + hard straight-through
+            # hard=True: forward uses argmax (actual token embeddings), backward uses soft gradient
+            # GPT-2 sees real tokens → V field is meaningful (fixes blurry embedding problem from exp 23-25)
+            gumbel_tau = tc.get("gumbel_tau", 0.0)
+            if gumbel_tau > 0:
+                gumbel_k = tc.get("gumbel_topk", 64)
                 flat = enc_input.reshape(-1, enc_input.shape[-1])  # (B*S, D)
-                # Cosine similarity for token selection (L2-normalize both sides)
-                flat_norm = nn.functional.normalize(flat, dim=-1)
-                vocab_norm = nn.functional.normalize(vocab_embs_device, dim=-1)
-                sims = flat_norm @ vocab_norm.T  # (B*S, V), range [-1, 1]
-                topk_sims, topk_ids = sims.topk(snap_k, dim=-1)  # (B*S, k)
-                # Plain softmax — no Gumbel noise, simplex-constrained by construction
-                weights = nn.functional.softmax(topk_sims / snap_tau, dim=-1)  # (B*S, k)
-                # Weighted sum of ORIGINAL vocab embeddings (preserves GPT-2 input scale)
+                D = flat.shape[-1]
+                sims = flat @ vocab_embs_device.T / math.sqrt(D)  # sqrt(D) scaling (exp 23)
+                topk_sims, topk_ids = sims.topk(gumbel_k, dim=-1)  # (B*S, k)
+                # Hard Gumbel-Softmax: forward = one-hot (argmax), backward = soft gradient
+                weights = nn.functional.gumbel_softmax(topk_sims, tau=gumbel_tau, hard=True)  # (B*S, k)
                 topk_embs = vocab_embs_device[topk_ids]  # (B*S, k, D)
                 enc_input = (weights.unsqueeze(-1) * topk_embs).sum(dim=1)  # (B*S, D)
                 enc_input = enc_input.reshape(B, -1, topk_embs.shape[-1])
@@ -326,17 +319,37 @@ def train(config_path: str = "configs/default.yaml"):
             with torch.no_grad():
                 with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
                     real_features = encoder(input_ids=suffix_ids, attention_mask=suffix_mask)
-            real_pooled = pool_features(real_features, pooler, suffix_mask)
 
             feat_noise_std = 0.0
-            if smooth_proj is not None:
-                feat_noise_std = smooth_cfg.get("feature_noise_std", 0.1)
-                if feat_noise_std > 0:
-                    real_pooled = [
-                        (name, feat.detach() + torch.randn_like(feat) * feat_noise_std)
-                        for name, feat in real_pooled
-                    ]
-                real_pooled = smooth_proj(real_pooled)
+            per_pos_drift = tc.get("per_position_drift", False)
+            if per_pos_drift:
+                # Per-position drift (exp 26): use raw per-position hidden states
+                # instead of multi-scale pooling. Each position gets its own V.
+                drift_layer = tc.get("drift_layer", 12)
+                n_drift_pos = tc.get("n_drift_positions", 32)
+                real_per_pos = real_features[drift_layer]  # (B_pos, S_suffix, 768)
+                S_suffix = real_per_pos.shape[1]
+                idx_real = torch.randperm(S_suffix, device=device)[:n_drift_pos]
+                real_flat = real_per_pos[:, idx_real].reshape(-1, real_per_pos.shape[-1])  # (B_pos*n, 768)
+                real_pooled = [("per_pos", real_flat)]
+                if smooth_proj is not None:
+                    feat_noise_std = smooth_cfg.get("feature_noise_std", 0.1)
+                    if feat_noise_std > 0:
+                        real_pooled = [
+                            (name, feat.detach() + torch.randn_like(feat) * feat_noise_std)
+                            for name, feat in real_pooled
+                        ]
+                    real_pooled = smooth_proj(real_pooled)
+            else:
+                real_pooled = pool_features(real_features, pooler, suffix_mask)
+                if smooth_proj is not None:
+                    feat_noise_std = smooth_cfg.get("feature_noise_std", 0.1)
+                    if feat_noise_std > 0:
+                        real_pooled = [
+                            (name, feat.detach() + torch.randn_like(feat) * feat_noise_std)
+                            for name, feat in real_pooled
+                        ]
+                    real_pooled = smooth_proj(real_pooled)
 
             # Negatives selection: MoCo queue > random neg > self-contrastive
             neg_pooled = None  # None = self-contrastive (default)
@@ -387,7 +400,16 @@ def train(config_path: str = "configs/default.yaml"):
               for refine_k in range(n_refine):
                 with torch.amp.autocast(device.type, enabled=use_bf16, dtype=torch.bfloat16):
                     gen_features = encoder(inputs_embeds=enc_input, attention_mask=None)
-                gen_pooled = pool_features(gen_features, pooler, None)
+
+                if per_pos_drift:
+                    # Per-position drift (exp 26): match real features format
+                    gen_per_pos = gen_features[drift_layer]  # (B, S_suffix, 768)
+                    S_gen = gen_per_pos.shape[1]
+                    idx_gen = torch.randperm(S_gen, device=device)[:n_drift_pos]
+                    gen_flat = gen_per_pos[:, idx_gen].reshape(-1, gen_per_pos.shape[-1])
+                    gen_pooled = [("per_pos", gen_flat)]
+                else:
+                    gen_pooled = pool_features(gen_features, pooler, None)
 
                 if smooth_proj is not None:
                     if feat_noise_std > 0:
@@ -437,8 +459,11 @@ def train(config_path: str = "configs/default.yaml"):
             if smooth_proj is not None:
                 smooth_weight = smooth_cfg.get("smoothness_weight", 0.01)
                 if smooth_weight > 0:
-                    # Recompute on clean (un-noised) pooled features
-                    clean_pooled = pool_features(real_features, pooler, suffix_mask)
+                    # Recompute on clean (un-noised) features
+                    if per_pos_drift:
+                        clean_pooled = [("per_pos", real_flat.detach())]
+                    else:
+                        clean_pooled = pool_features(real_features, pooler, suffix_mask)
                     s_loss = smooth_proj.smoothness_loss(
                         clean_pooled,
                         noise_std=smooth_cfg.get("lipschitz_noise_std", 0.1),
@@ -499,7 +524,7 @@ def train(config_path: str = "configs/default.yaml"):
                 metrics["bigram_div"] = bigram_div_loss.item()
 
             # Unique token ratio — non-differentiable monitoring
-            if pos_div_weight > 0 or bigram_div_weight > 0:
+            if pos_div_weight > 0 or bigram_div_weight > 0 or per_pos_drift or gumbel_tau > 0:
                 with torch.no_grad():
                     flat_enc = enc_input.detach().reshape(-1, enc_input.shape[-1])
                     nearest = torch.cdist(flat_enc, vocab_embs_device if vocab_embs_device is not None else vocab_embeddings.to(device)).argmin(dim=-1)
@@ -510,10 +535,8 @@ def train(config_path: str = "configs/default.yaml"):
                         uniq_ratios.append(n_uniq / nearest.shape[1])
                     metrics["uniq_ratio"] = sum(uniq_ratios) / len(uniq_ratios)
 
-            if snap_tau_start > 0:
-                metrics["snap_tau"] = snap_tau
-            elif tc.get("gumbel_tau", 0.0) > 0:
-                metrics["gumbel_tau"] = tc["gumbel_tau"]
+            if gumbel_tau > 0:
+                metrics["gumbel_tau"] = gumbel_tau
 
             # GPT-2 perplexity-matching loss — target natural entropy, not minimum
             lm_weight = tc.get("lm_weight", 0.0)
@@ -685,8 +708,6 @@ def train(config_path: str = "configs/default.yaml"):
                 diag_parts.append(f"rep={metrics['rep_loss']:.2f}")
             if "rep_cos" in metrics:
                 diag_parts.append(f"rcos={metrics['rep_cos']:.2f}")
-            if "snap_tau" in metrics:
-                diag_parts.append(f"stau={metrics['snap_tau']:.3f}")
             if "gumbel_tau" in metrics:
                 diag_parts.append(f"gtau={metrics['gumbel_tau']:.2f}")
             if "rand_neg" in metrics:

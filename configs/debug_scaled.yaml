@@ -46,14 +46,16 @@ training:
   max_steps: 2000            # longer run to see if collapse develops
   diversity_weight: 0.5      # log-barrier
   spectral_weight: 0.01
-  vocab_anchor_weight: 0.0     # Disabled — simplex snap keeps embeddings on-manifold (exp 25)
+  vocab_anchor_weight: 0.0     # Disabled — top-k Gumbel makes vanc ~0 by construction (exp 24)
   lm_weight: 0.0             # Disabled — perplexity matching doesn't prevent garbage
   rep_penalty_weight: 0.0     # Disabled — too weak to overcome other losses
-  snap_tau_start: 1.0         # Simplex snap temperature — start soft (exp 25)
-  snap_tau_end: 0.1           # Anneal to hard over training
-  snap_topk: 64               # Number of nearest vocab tokens to consider per position
-  position_diversity_weight: 5.0   # Intra-sequence position diversity (anti-repetition)
-  bigram_diversity_weight: 2.0     # Bigram diversity (catches alternating patterns)
+  gumbel_tau: 0.3             # Top-k Gumbel-Softmax temperature (exp 26: hard=True)
+  gumbel_topk: 64             # Number of nearest vocab tokens to consider per position
+  per_position_drift: true         # Per-position features instead of pooling (exp 26)
+  drift_layer: 12                  # GPT-2 layer for per-position features
+  n_drift_positions: 32            # Subsample positions for drift (memory)
+  position_diversity_weight: 0.0   # Disabled — per-position drift handles diversity (exp 26)
+  bigram_diversity_weight: 0.0     # Disabled — per-position drift handles diversity (exp 26)
   n_refine_steps: 1           # Disable refinement to isolate new losses
   refine_lr: 0.1              # Step size for refinement gradient descent
   refine_lr_decay: 0.5        # Decay factor per refinement step (eta_k = lr * decay^k)
